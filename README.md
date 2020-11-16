@@ -1,4 +1,4 @@
-# Analysis of Effects of DIH Prosecutions on Drug Overdose Deaths
+# Drug Induced Homicide Prosecutions and Overdose Death in the United States: What’s the “Message”?
 
 This GitHub Repository contains the code used for the analyses for the paper "Drug Induced Homicide Prosecutions and Overdose Death in the United States: What’s the “Message”?"
 

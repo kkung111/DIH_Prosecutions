@@ -92,7 +92,7 @@ main_analysis_data_sum <- main_analysis_data %>% group_by(year = year(Time_Perio
 ggplot(data = main_analysis_data_sum, mapping = aes(x = date,
                                                     y = total_deaths)) +
   geom_line() +
-  labs(x = "Year", y = "Total Deaths in 50 U.S. States") +
+  labs(x = "Year", y = "Total Unintentional Deaths in 50 U.S. States") +
   theme(panel.background = element_rect("white"), panel.border = element_blank(), panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
         axis.title=element_text(family="Times", size=10, face="bold"),
@@ -109,24 +109,37 @@ numStates<-c()
 
 #for each time period i, we first find the states where the first intervention date occurred before i
 #then, we append it to numStates
-for(i in unique((main_analysis_data$Time_Period_Start))){
+for(i in unique((num_states_with_intervention$Start_Date))){
   states_w_int<-unique(main_analysis_data$State[(main_analysis_data$Intervention_First_Date)<=i])
   numStates<-append(numStates, length(states_w_int[!is.na(states_w_int)]))
 }
 num_states_with_intervention$numStates<-numStates
+num_states_with_intervention$Start_Date <- as.Date(num_states_with_intervention$Start_Date)
+num_states_with_intervention <- rbind(data.frame("Start_Date" = c(as.Date("2000-01-01"), 
+                                                                  as.Date("2017-12-31")), 
+                                                 "numStates" = c(0, max(num_states_with_intervention$numStates))), 
+                                      num_states_with_intervention)
+num_states_with_intervention <- num_states_with_intervention %>% arrange(Start_Date) %>% 
+  mutate(lag_numStates = lag(numStates))
 
-# pdf("Figures/num_states_with_intervention_10_23_20.pdf")
-ggplot(num_states_with_intervention, aes(x = Start_Date, y = numStates, group = 1)) +
-  geom_line() + labs(x = "Year", y = "Number of States") +
+num_states_with_intervention <- num_states_with_intervention %>% 
+  pivot_longer( c("lag_numStates", "numStates"), "numStates")
+
+# pdf("Figures/num_states_with_intervention_11_29_20.pdf")
+ggplot(num_states_with_intervention, aes(x = Start_Date, y = value, group = 1)) + 
+  # geom_point() +
+  geom_line() +
+  labs(x = "Year", y = "Number of States") +
   theme(axis.text=element_text(family="Times",size=10),
-        axis.title=element_text(family="Times", size=10, face="bold"),
+        axis.title=element_text(family="Times", size=10, face="bold"), 
         panel.border = element_blank(), panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
         axis.text.x = element_text(family="Times", size=10),
-        panel.background = element_rect("white")) +
-  scale_x_date(date_labels="%Y", breaks = seq(as.Date("2000-01-01"), as.Date("2018-01-01"), by = "2 years"))
+        panel.background = element_rect("white")) + 
+  scale_x_date(date_labels="%Y", breaks = seq(as.Date("2000-01-01"), as.Date("2018-01-01"), by = "2 years")) 
 
 # dev.off()
+
 
 ##############################################################################
 ####################### Create Table of the Policy Dates #####################
@@ -1137,44 +1150,41 @@ startYear<-1999
 
 for(state in unique(od_data$State)){
   #get the values of the deaths for state
-  tempVal<-od_data$Deaths[od_data$State == state]
+  currentDeaths<-od_data$Deaths[od_data$State == state]
   for(year in startYear:2018){
     #find the indices of the missing data -- gets the missing indices for that particular year
-    indexMissing<-which(is.na(tempVal[(1:12) + 12*(year - startYear)]))
+    indexMissing <- which(is.na(currentDeaths[(1:12) + 12*(year - startYear)]))
     if(length(indexMissing) != 0){
       #if there are missing values, we find the number of accounted deaths
-      tempDataSum<-sum(tempVal[(1:12) + 12*(year - startYear)], na.rm = TRUE)
+      currentDeathsTotal <- sum(currentDeaths[(1:12) + 12*(year - startYear)], na.rm = TRUE)
       #and calculate the deaths that are not accounted for using the yearly deaths for the state
-      numNotAccounted<-od_year$Deaths[od_year$State == state & od_year$Year == year] - tempDataSum
-
-      #we then calculate the weight: number of not accounted deaths/sum of accounted deaths
-      denom<-sum(tempVal[(1:12) + 12*(year - startYear)][indexMissing], na.rm = TRUE)
-      tempVal[(1:12) + 12*(year - startYear)][indexMissing]<-sapply(tempVal[(1:12) + 12*(year - startYear)][indexMissing], function(x){
-        if(!is.na(x)){x*(numNotAccounted/denom)}else{numNotAccounted/length(indexMissing)}})
+      numNotAccounted <- od_year$Deaths[od_year$State == state & od_year$Year == year] - currentDeathsTotal
+      
+      #we then divide number of unaccounted deaths evenly by the number of months with missing values 
+      currentDeaths[(1:12) + 12*(year - startYear)][indexMissing] <- numNotAccounted/length(indexMissing)
     }else{
       #otherwise, if there is no missing values, we skip to the next year
       next
     }
   }
-  #store the interpolated values
-  od_data$imputed_vals[od_data$State == state]<-tempVal
+  #store the imputed values
+  od_data$imputed_vals[od_data$State == state]<-currentDeaths
 }
 
-#group into 6 month time periods now
-od_data<- od_data %>%
-  mutate(Time_Period_Start = lubridate::floor_date(Date , "6 months" ))
-
-#compute the total number of deaths in each period
-od_data<- od_data %>% group_by(State, Time_Period_Start) %>%
+#group into 6 month time periods now and compute the total number of deaths in each period
+od_data_grouped_data <- od_data %>%
+  mutate(Time_Period_Start = lubridate::floor_date(Date , "6 months" )) %>% 
+  group_by(State, Time_Period_Start) %>%
   summarise(sum_deaths = sum(imputed_vals, na.rm = TRUE))
 
 #restrict the dataset to be between 2000 and 2017
-od_data <- od_data[year(od_data$Time_Period_Start) > 1999 &
-                     year(od_data$Time_Period_Start) < 2018,]
+od_data_grouped_data <- od_data_grouped_data[year(od_data_grouped_data$Time_Period_Start) > 1999 &
+                     year(od_data_grouped_data$Time_Period_Start) < 2018,]
 
-#create a new dataset for the analysis
+#create a new dataset for the analysis using columns from the main analysis data
 sensitivity_anlys_imputed_od_wo_interp_data <- main_analysis_data %>%
-  mutate(imputed_deaths_no_interp = od_data$sum_deaths,
+  select(-c(imputed_deaths, num_alive)) %>% #want to remove the outcome from main analysis to not get confused
+  mutate(imputed_deaths_no_interp = od_data_grouped_data$sum_deaths,
          num_alive_no_interp = population - imputed_deaths_no_interp)
 
 #run the model for analysis
@@ -1194,6 +1204,7 @@ sensitivity_anlys_imputed_od_wo_interp <- gam(cbind(round(imputed_deaths_no_inte
                                             family = "binomial")
 
 summary(sensitivity_anlys_imputed_od_wo_interp)
+exp(coef(sensitivity_anlys_imputed_od_wo_interp)["Intervention_Redefined"]) #1.0782
 
 #######################################################################################
 ########### Sensitivity Analysis 4: Two Year Intervention Effect ######################
@@ -1273,7 +1284,7 @@ for(state in unique(sensitivity_anlys_redefine_int_data$State)){
       # 3) row i contains effects from both a new intervention starting in row i and lasting
       # effects from 2 years ago
 
-      #To compute the fraction, we add the number of days that are effected by an intervention
+      #To compute the fraction, we add the number of days that are affected by an intervention
       #(from both the current prosecution and previous prosecution) and then divide by the total
       #number of days in the period:
       #If there is no prosecution in the period i, then the start_date is the last date in the period.
@@ -1499,7 +1510,7 @@ ggplot(yearly_num_Attr_Deaths_redefine_int, aes(x = year, y = deaths)) + geom_li
 
 
 ####################################################################################
-############# Sensitivity Analysis 5: Two Year Lagged Effect  ######################
+############# Sensitivity Analysis 5: Two Year Effect Lagged by 6 months ######################
 #create a plot for each state to see how many prosecution media alerts there are per 6 month period
 #read in the prosecution media alert data
 prosecution_data<-read.csv("./Data/prosecution_media_alert_5_5_19.csv")
@@ -1538,7 +1549,8 @@ prosecution_data_by_six_month_pd <- prosecution_data %>%
 #create the data set used for this sensitivity analysis
 #first, we merge the grouped prosecution data set with the main data set by state and time period
 sensitivity_anlys_2yr_int_lag<-merge(main_analysis_data,
-                                     prosecution_data_by_six_month_pd, by.x = c("State", "Time_Period_Start"),
+                                     prosecution_data_by_six_month_pd, 
+                                     by.x = c("State", "Time_Period_Start"),
                                      by.y = c("ID", "six_month_pd"), all = TRUE)
 
 #create a intervention 2 year effect variable by initializing it to be all 0
@@ -1549,27 +1561,29 @@ sensitivity_anlys_2yr_int_lag<-sensitivity_anlys_2yr_int_lag %>% group_by(State)
 sensitivity_anlys_2yr_int_lag$Time_Period_Start<-as.Date(sensitivity_anlys_2yr_int_lag$Time_Period_Start)
 sensitivity_anlys_2yr_int_lag$Time_Period_End<-as.Date(sensitivity_anlys_2yr_int_lag$Time_Period_End)
 
-#we need to impute the newly defined intervention variable depending on the case
+#we need to calculate the 2 year intervention variable depending on the case
 #by examining each row of the data set
 for(state in unique(sensitivity_anlys_2yr_int_lag$State)){
   #first, subset the data set into state_data which only contains the data for the state
   state_index<-which(sensitivity_anlys_2yr_int_lag$State == state)
   state_data<-sensitivity_anlys_2yr_int_lag[state_index,]
 
-  #note that the first four rows of the 2 year effect intervention variable are the same as the
-  #first four rows of the original intervention variable
-  state_data$int_2_yr_effect_lag[2:5]<-state_data$Intervention_Redefined[1:4]
-
   for(i in 1:(nrow(state_data)-1)){
-    #deal with the states that had at least one prosecution in the first 2 years of analysis period
+    #for the states that had at least one prosecution in the first 2 years of analysis period,
+    #we impute the intervention variable based on the intervention variable of main analysis:
+    #if intervention occurred in time i, then for the 6-month lagged effect, we compute the 
+    #proportion of days affected by intervention, taking into account the 6 month lag. Else, 
+    #if the intervention had occurred by time i, we impute a 1 in the next six-month interval
+    #since lagged
     if(i %in% c(1:4)){
       if(state_data$Intervention_Redefined[i] > 0 & state_data$Intervention_Redefined[i] < 1){
         state_data$int_2_yr_effect_lag[i + 1] <- as.numeric(state_data$Time_Period_End[i + 1] - (state_data$first_date_in_pd[i] %m+% months(6)))/as.numeric(state_data$Time_Period_End[i + 1] - state_data$Time_Period_Start[i + 1])
       }else if(state_data$Intervention_Redefined[i] == 1){
         state_data$int_2_yr_effect_lag[i + 1] <- 1
       }
-      #next, we deal with the rows where there was at least one prosecution in the last 3 six month periods
-      #These rows will be imputed with a 1
+      
+      #next, if there was at least one prosecution in the last 3 six-month periods (i.e. 1.5 years) before time i
+      #These rows will be imputed with a 1 in the next six-month interval since lagged
     }else if((!is.na(state_data$first_date_in_pd[i - 1]) |
               !is.na(state_data$first_date_in_pd[i - 2]) |
               !is.na(state_data$first_date_in_pd[i - 3]))){
@@ -1582,24 +1596,29 @@ for(state in unique(sensitivity_anlys_2yr_int_lag$State)){
       # 2) row i contains the lasting effects of an intervention that occurred 2 years ago
       # 3) row i contains effects from both a new intervention starting in row i and lasting
       # effects from 2 years ago
-
-      #To compute the fraction, we add the number of days that are effected by an intervention
+      
+      #To compute the fraction, we add the number of days that are affected by an intervention
       #(from both the current prosecution and previous prosecution) and then divide by the total
       #number of days in the period:
-      #If there is no prosecution in the period i, then the start_date is the last date in the period.
-      #We subtract start_date from the last date in the period, so we will get a 0 for the number
-      #of days that are affected by a prosecution in period i. Otherwise, the start_date is the
-      #first date of a prosecution in the period.
-      #If there is no prosecution two years ago, i.e. in period i-4, then the last_date is the first
-      #date in the period. We subtract the last_date by the first date in the period, so we will get
-      #a 0 for the number of days that are affected by a prosecution from period i-4. Otherwise,
-      #the last_date is the last date of prosecution from period i-4, plus 2 years.
-
+      
+      #first, we compute the number of days in the period of time interval i + 1
       total_len_of_pd<-as.numeric(state_data$Time_Period_End[i + 1] - state_data$Time_Period_Start[i + 1])
+      
+      #If there is no prosecution two years ago, i.e. in period i-4, then the last_date is the first
+      #date in period i + 1. We subtract the last_date by the first date in period i + 1, so we will get
+      #a 0 for the number of days that are affected by a prosecution from period i-4. Otherwise,
+      #the last_date is the last date of prosecution from period i-4, plus 2 years. 
+      #The start time is the first date of period i + 1
+      
       len_of_past_effect <- ifelse(!is.na(state_data$first_date_in_pd[i - 4]),
                                    as.numeric((as.Date(state_data$last_date_in_pd[i - 4] + years(2), format = "%Y-%m-%d") %m+% months(6)) - state_data$Time_Period_Start[i + 1]),
                                    0)
-
+      
+      #If there is no prosecution in the period i, then the start_date is the last date in period i + 1 (because lagged effect).
+      #We subtract start_date from the last date in period i + 1, so we will get a 0 for the number
+      #of days that are affected by a prosecution in period i. Otherwise, the start_date is the
+      #first date of a prosecution in period i + 6 months. The end date is the last date in period i + 1. 
+    
       len_of_current_effect <- ifelse(!is.na(state_data$first_date_in_pd[i]),
                                       as.numeric(state_data$Time_Period_End[i + 1] - (state_data$first_date_in_pd[i] %m+% months(6))),
                                       0)
@@ -1764,7 +1783,7 @@ num_attr_od_UB<-num_attr_od_LB<-num_attr_od<-rep(NA, length(unique(attr_deaths_a
 
 
 #for each time period, we first find the indices of rows containing data from that time point
-#then, we find the total number of deaths that attributable to the intervention
+#then, we find the total number of deaths attributable to the intervention
 
 index<-1 #keep track of where to store the values in the vector
 
@@ -1814,53 +1833,54 @@ ggplot(yearly_num_Attr_Deaths_2yr_int_lag, aes(x = year, y = deaths)) + geom_lin
 
 ###########################################################################################
 ########################## Compiled Attributable Deaths Plot###############################
-# pdf("Figures/num_attr_deaths_yearly_for_all_anlys_10_23_20_all_od.pdf")
-ggplot(yearly_num_Attr_Deaths_main_analysis) +
-  geom_line(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "Main Analysis"),
-            linetype = "solid") +
-  geom_point(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "Main Analysis"))  +
+# pdf("Figures/num_attr_deaths_yearly_for_all_anlys_11_29_20_all_od.pdf")
+ggplot(yearly_num_Attr_Deaths_main_analysis) + 
+  geom_line(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "a"), 
+            linetype = "solid") + 
+  geom_point(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "a"))  +
   geom_line(yearly_num_Attr_Deaths_main_analysis, mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                                                                color = "Main Analysis"),
+                                                                color = "a"),
             linetype = 'dashed') +
   geom_line(yearly_num_Attr_Deaths_main_analysis, mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                                                                color ="Main Analysis"),
+                                                                color ="a"),
             linetype = 'dashed') +
-  geom_line(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                               color = "2 Year Effect"), linetype = "solid") +
-  geom_point(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                                color = "2 Year Effect"))  +
-  geom_line(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                                                               color = "2 Year Effect"),linetype = 'dashed') +
-  geom_line(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                                                               color = "2 Year Effect"), linetype = 'dashed') +
+  geom_line(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, 
+                                                               color = "d"), linetype = "solid") + 
+  geom_point(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, 
+                                                                color = "d"))  +
+  geom_line(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,  
+                                                               color = "d"),linetype = 'dashed') +
+  geom_line(yearly_num_Attr_Deaths_redefine_int, mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,  
+                                                               color = "d"), linetype = 'dashed') + 
   geom_line(yearly_num_Attr_Deaths_od_all, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                         color = "All Drug Overdose Deaths"), linetype = "solid", alpha = 0.5) +
+                                                         color = "b"), linetype = "solid", alpha = 0.5) +
   geom_point(yearly_num_Attr_Deaths_od_all, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                          color = "All Drug Overdose Deaths"), alpha = 0.5)  +
+                                                          color = "b"), alpha = 0.5)  +
   geom_line(yearly_num_Attr_Deaths_od_all, mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                                                         color = "All Drug Overdose Deaths"),linetype = 'dashed', alpha = 0.5) +
+                                                         color = "b"),linetype = 'dashed', alpha = 0.5) +
   geom_line(yearly_num_Attr_Deaths_od_all, mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                                                         color = "All Drug Overdose Deaths"), linetype = 'dashed', alpha = 0.5) +
+                                                         color = "b"), linetype = 'dashed', alpha = 0.5) +
   geom_line(yearly_num_Attr_Deaths_exclude_states, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                                 color = "Excluding States with At Least 75% Missing Monthly"), linetype = "solid", alpha = 0.5) +
+                                                                 color = "c"), linetype = "solid", alpha = 0.5) +
   geom_point(yearly_num_Attr_Deaths_exclude_states, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                                  color = "Excluding States with At Least 75% Missing Monthly"), alpha = 0.5)  +
+                                                                  color = "c"), alpha = 0.5)  +
   geom_line(yearly_num_Attr_Deaths_exclude_states, mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                                                                 color = "Excluding States with At Least 75% Missing Monthly"),linetype = 'dashed', alpha = 0.5) +
+                                                                 color = "c"),linetype = 'dashed', alpha = 0.5) +
   geom_line(yearly_num_Attr_Deaths_exclude_states, mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                                                                 color = "Excluding States with At Least 75% Missing Monthly"), linetype = 'dashed', alpha = 0.5) +
- theme(axis.text.y=element_text(size=10, family = "Times"),
+                                                                 color = "c"), linetype = 'dashed', alpha = 0.5) +
+ theme(axis.text.y=element_text(size=10, family = "Times"), 
         axis.title=element_text(size=10,face="bold", family = "Times"),
         panel.border = element_blank(), panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
         axis.text.x = element_text(size = 10, family = "Times"),
-        panel.background = element_rect("white"),
-        legend.text=element_text(size=10, family = "Times"), legend.position = "bottom",
+        panel.background = element_rect("white"), 
+        legend.text=element_text(size=10, family = "Times"), legend.position = "bottom", 
         legend.box="vertical", legend.margin=margin()) +
-  guides(color=guide_legend(nrow=2,byrow=TRUE)) +
-  labs(x = "Year", y = "Yearly Deaths Attributable to DIH Prosecutions Reported in Media", color = "") +
-  scale_color_manual(values=c('blue', 'red', 'green', 'black')) +
-  scale_x_date(date_labels="%Y", breaks = seq(as.Date("2000-01-01"), as.Date("2018-01-01"), by = "2 years"))
+  guides(color=guide_legend(nrow=2,byrow=TRUE)) + 
+  labs(x = "Year", y = "Yearly Deaths Attributable to DIH Prosecutions Reported in Media", color = "") + 
+  scale_color_manual(values=c('black', 'red', 'green', 'blue'), 
+                     labels = c("Main Analysis", "All Drug Overdose Deaths", 
+                                "Excluding States with At Least 75% Missing Monthly", "2 Year Effect")) + 
+  scale_x_date(date_labels="%Y", breaks = seq(as.Date("2000-01-01"), as.Date("2018-01-01"), by = "2 years")) 
 
 # dev.off()
-

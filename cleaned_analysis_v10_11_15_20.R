@@ -502,6 +502,7 @@ ggplot(yearly_num_Attr_Deaths_main_analysis, aes(x = year, y = deaths, group = 1
 ##############################################################################################3
 ############################## Secondary Analysis: All Overdose Deaths ###############################
 od_all_data <- read.csv("./Data/full_data_set_9_1_20_all_od.csv")
+#rename column of imputed deaths to "imputed_deaths"
 colnames(od_all_data)[which(colnames(od_all_data) == "sum_deaths")] <- "imputed_deaths"
 od_all_data$Time_Period_Start <- as.Date(od_all_data$Time_Period_Start)
 od_all_data$Intervention_First_Date <- as.Date(od_all_data$Intervention_First_Date)
@@ -1037,12 +1038,6 @@ head(sensitivity_anlys_exclude_states_covariate_table, 10)
 #save the table into a CSV
 # write.csv(round(sensitivity_anlys_exclude_states_covariate_table, 3), "./Data/coefficients_covariates_9_1_20_full_data_exclude_states.csv")
 
-#compute percent difference of the intervention coefficient
-main_anlysis_coef <- main_analysis_covariate_table$Risk_Ratio_Estimates[row.names(main_analysis_covariate_table) == "Intervention"]
-exclude_states_coef <- sensitivity_anlys_exclude_states_covariate_table$Risk_Ratio_Estimates[row.names(sensitivity_anlys_exclude_states_covariate_table) == "Intervention_Redefined"]
-
-100*(exclude_states_coef - main_anlysis_coef)/main_anlysis_coef
-
 ################ Sensitivity Analysis 2: Number of Attributable Deaths #############
 #first, we subset the data so that we only focus on the time points for which at least one state had the intervention
 attr_deaths_anlys_exclude_states<-sensitivity_anlys_exclude_states_data[which(sensitivity_anlys_exclude_states_data$Intervention_Redefined>0),]
@@ -1183,9 +1178,10 @@ od_data_grouped_data <- od_data_grouped_data[year(od_data_grouped_data$Time_Peri
 
 #create a new dataset for the analysis using columns from the main analysis data
 sensitivity_anlys_imputed_od_wo_interp_data <- main_analysis_data %>%
-  select(-c(imputed_deaths, num_alive)) %>% #want to remove the outcome from main analysis to not get confused
   mutate(imputed_deaths_no_interp = od_data_grouped_data$sum_deaths,
-         num_alive_no_interp = population - imputed_deaths_no_interp)
+         num_alive_no_interp = population - imputed_deaths_no_interp) %>%
+  dplyr::select(-c(imputed_deaths, num_alive)) #want to remove the outcome from main analysis to not get confused
+  
 
 #run the model for analysis
 sensitivity_anlys_imputed_od_wo_interp <- gam(cbind(round(imputed_deaths_no_interp),
@@ -1205,6 +1201,170 @@ sensitivity_anlys_imputed_od_wo_interp <- gam(cbind(round(imputed_deaths_no_inte
 
 summary(sensitivity_anlys_imputed_od_wo_interp)
 exp(coef(sensitivity_anlys_imputed_od_wo_interp)["Intervention_Redefined"]) #1.0782
+
+########## Sensitivity Analysis 3: Make Data Frame of Results and 95% CI #############
+#store the coefficients into the table
+sensitivity_anlys_wo_interp_full_table<-data.frame(coef(sensitivity_anlys_imputed_od_wo_interp))
+#check to see how the table looks
+head(sensitivity_anlys_wo_interp_full_table)
+#rename the column to "Coefficient_Estimate"
+colnames(sensitivity_anlys_wo_interp_full_table)<-c("Coefficient_Estimate")
+
+#vector of covariates
+covariates<-c("Naloxone_Pharmacy_Yes_Redefined", "Naloxone_Pharmacy_No_Redefined",
+              "Medical_Marijuana_Redefined",
+              "Recreational_Marijuana_Redefined",
+              "GSL_Redefined", "PDMP_Redefined",
+              "Medicaid_Expansion_Redefined", "Intervention_Redefined")
+
+#rename the variable names of the regression output so that they look nicer:
+#currently there are 3 types of coefficients: state effects, the covariates, and smoothed time effects
+#for each row in the main analysis table
+for(i in 1:length(rownames(sensitivity_anlys_wo_interp_full_table))){
+  
+  #if the coefficient is not in the covariates vector
+  if(!(rownames(sensitivity_anlys_wo_interp_full_table)[i] %in% covariates)){
+    
+    #we see if it's a state effect
+    if(substr(rownames(sensitivity_anlys_wo_interp_full_table)[i], start = 1, stop = 5) == "State"){
+      
+      #if so, here, the names look like: StateMassachusetts or StateGeorgia, so take out the "State" part
+      #and just rename these rows to just the state name
+      rownames(sensitivity_anlys_wo_interp_full_table)[i]<-substr(rownames(sensitivity_anlys_wo_interp_full_table)[i], start = 6,
+                                                                       stop = nchar(rownames(sensitivity_anlys_wo_interp_full_table)[i]))
+      
+    }else if(rownames(sensitivity_anlys_wo_interp_full_table)[i] == "(Intercept)"){
+      
+      #otherwise, if the current name is Intercept, we rename it so that we know that Alabama is the baseline
+      rownames(sensitivity_anlys_wo_interp_full_table)[i]<-"Intercept/Alabama"
+      
+    }else if(substr(rownames(sensitivity_anlys_wo_interp_full_table)[i], start = 1, stop = 35) == "s(Time_Period_ID):as.factor(Region)"){
+      
+      #otherwise, it's the smoothed time effects which look like: s(Time_Period_ID):as.factor(Region)West
+      #or s(Time_Period_ID):as.factor(Region)South, so we want to get rid of "s(Time_Period_ID):as.factor(Region)"
+      #and change it to "Smoothed Time for Region"
+      rownames(sensitivity_anlys_wo_interp_full_table)[i]<-paste("Smoothed Time for Region ",
+                                                                      substr(rownames(sensitivity_anlys_wo_interp_full_table)[i], start = 36,
+                                                                             stop = nchar(rownames(sensitivity_anlys_wo_interp_full_table)[i])),
+                                                                      sep = "")
+      
+    }
+  }
+}
+
+#confidence intervals for the coefficients
+sensitivity_anlys_wo_interp_full_table$Coefficient_Lower_Bound<-sensitivity_anlys_wo_interp_full_table$Coefficient_Estimate - 1.96*summary(sensitivity_anlys_imputed_od_wo_interp)$se
+sensitivity_anlys_wo_interp_full_table$Coefficient_Upper_Bound<-sensitivity_anlys_wo_interp_full_table$Coefficient_Estimate + 1.96*summary(sensitivity_anlys_imputed_od_wo_interp)$se
+
+#impute the estimates and confidence intervals in the odds ratio scale
+sensitivity_anlys_wo_interp_full_table$Odds_Ratio<-exp(sensitivity_anlys_wo_interp_full_table$Coefficient_Estimate)
+sensitivity_anlys_wo_interp_full_table$Odds_Ratio_LB<-exp(sensitivity_anlys_wo_interp_full_table$Coefficient_Lower_Bound)
+sensitivity_anlys_wo_interp_full_table$Odds_Ratio_UB<-exp(sensitivity_anlys_wo_interp_full_table$Coefficient_Upper_Bound)
+
+#store the standard error and p-value
+sensitivity_anlys_wo_interp_full_table$Standard_Error<-summary(sensitivity_anlys_imputed_od_wo_interp)$se
+#note that there is no p-value for the smoothed time effects, so we put a NA for those rows
+sensitivity_anlys_wo_interp_full_table$p_value<-c(summary(sensitivity_anlys_imputed_od_wo_interp)$p.pv,
+                                                       rep(NA, length(coef(sensitivity_anlys_imputed_od_wo_interp)) -
+                                                             length(summary(sensitivity_anlys_imputed_od_wo_interp)$p.pv)))
+
+head(sensitivity_anlys_wo_interp_full_table)
+tail(sensitivity_anlys_wo_interp_full_table)
+
+#export a table with just the covariates
+#first, find the rows that contains the covariates
+covariate_Index<-which(rownames(sensitivity_anlys_wo_interp_full_table) %in% covariates)
+sensitivity_anlys_wo_interp_covariate_table<-(round(sensitivity_anlys_wo_interp_full_table[covariate_Index,], 5))
+
+#rename the variables so that it looks cleaner
+rownames(sensitivity_anlys_wo_interp_covariate_table)<-c("Naloxone_Pharmacy_Yes", "Naloxone_Pharmacy_No",
+                                                              "Medical_Marijuana",
+                                                              "Recreational_Marijuana",
+                                                              "GSL", "PDMP", "Medicaid_Expansion",
+                                                              "Intervention_Redefined")
+
+#now, reorganize the data so that the covariates are on top and the rest of the variable sare below
+sensitivity_anlys_wo_interp_covariate_table<-rbind(sensitivity_anlys_wo_interp_covariate_table, sensitivity_anlys_wo_interp_full_table[-covariate_Index,])
+#remove the columns that aren't in odds ratio scale
+sensitivity_anlys_wo_interp_covariate_table<-sensitivity_anlys_wo_interp_covariate_table[,-which(colnames(sensitivity_anlys_wo_interp_covariate_table) %in%
+                                                                                                             c("Coefficient_Estimate", "Coefficient_Lower_Bound", "Coefficient_Upper_Bound", "Standard_Error"))]
+
+colnames(sensitivity_anlys_wo_interp_covariate_table)<-c("Risk_Ratio_Estimates", "RR_95_CI_LB", "RR_95_CI_UB", "p-value")
+head(sensitivity_anlys_wo_interp_covariate_table, 10)
+
+#save the table into a CSV
+# write.csv(round(sensitivity_anlys_wo_interp_covariate_table, 3), "./Data/coefficients_covariates_12_7_20_wo_interp.csv")
+
+################ Sensitivity Analysis 3: Number of Attributable Deaths #############
+#first, we subset the data so that we only focus on the time points for which at least one state had the intervention
+attr_deaths_anlys_wo_interp<-sensitivity_anlys_imputed_od_wo_interp_data[which(sensitivity_anlys_imputed_od_wo_interp_data$Intervention_Redefined>0),]
+
+#compute the probability of overdose had intervention not occurred
+prob_od_no_int_wo_interpolation<-expit(-coef(sensitivity_anlys_imputed_od_wo_interp)["Intervention_Redefined"]*attr_deaths_anlys_wo_interp$Intervention_Redefined
+                                     + logit(attr_deaths_anlys_wo_interp$imputed_deaths/attr_deaths_anlys_wo_interp$population))
+
+#compute the lower and upper bounds of 95% CI of probability of overdose had intervention not occurred
+#here, we compute the lower and upper bounds of the 95% CI of all the coefficients using the standard error from the model
+coef_lb<-coef(sensitivity_anlys_imputed_od_wo_interp) - 1.96*summary(sensitivity_anlys_imputed_od_wo_interp)$se
+coef_ub<-coef(sensitivity_anlys_imputed_od_wo_interp) + 1.96*summary(sensitivity_anlys_imputed_od_wo_interp)$se
+
+#we then calculate the upper and lower bounds of the probability of overdose death had intervention not occurred by using
+#the lower and upper bounds of the coefficient of the intervention variable
+prob_od_no_int_LB_wo_interp<-expit(-coef_lb[names(coef_lb) == "Intervention_Redefined"]*attr_deaths_anlys_wo_interp$Intervention_Redefined
+                                        + logit(attr_deaths_anlys_wo_interp$imputed_deaths/attr_deaths_anlys_wo_interp$population))
+
+prob_od_no_int_UB_wo_interp<-expit(-coef_ub[names(coef_ub) == "Intervention_Redefined"]*attr_deaths_anlys_wo_interp$Intervention_Redefined
+                                        + logit(attr_deaths_anlys_wo_interp$imputed_deaths/attr_deaths_anlys_wo_interp$population))
+
+#estimate the number of deaths attributable to the intervention
+#first, initialize the vectors to store the numbers
+num_attr_od_UB<-num_attr_od_LB<-num_attr_od<-rep(NA, length(unique(sensitivity_anlys_imputed_od_wo_interp_data$Time_Period_ID)))
+
+
+#for each time period, we first find the indices of rows containing data from that time point
+#then, we find the total number of deaths that attributable to the intervention
+
+index<-1 #keep track of where to store the values in the vector
+
+for(time in sort(unique(attr_deaths_anlys_wo_interp$Time_Period_ID))){
+  #find the indices of rows where the time point = time
+  time_point_index<-which(attr_deaths_anlys_wo_interp$Time_Period_ID == time)
+  
+  #find the number of deaths attributable to intervention = observed number of deaths with intervention - estimated number of deaths had intervention not occurred
+  num_attr_od[index]<-sum(attr_deaths_anlys_wo_interp$imputed_deaths[time_point_index]
+                          - prob_od_no_int_wo_interpolation[time_point_index]*attr_deaths_anlys_wo_interp$population[time_point_index])
+  
+  #find the lower and upper bounds of the estimated number of deaths attributable to the intervention
+  num_attr_od_LB[index]<-sum(attr_deaths_anlys_wo_interp$imputed_deaths[time_point_index]
+                             - prob_od_no_int_LB_wo_interp[time_point_index]*attr_deaths_anlys_wo_interp$population[time_point_index])
+  num_attr_od_UB[index]<-sum(attr_deaths_anlys_wo_interp$imputed_deaths[time_point_index]
+                             - prob_od_no_int_UB_wo_interp[time_point_index]*attr_deaths_anlys_wo_interp$population[time_point_index])
+  
+  
+  index<-index + 1
+}
+
+num_attr_od_wo_interpolation<-data.frame("Time_Period_ID" = sort(unique(attr_deaths_anlys_wo_interp$Time_Period_ID)),
+                                       "Time_Start" = sort(unique(attr_deaths_anlys_wo_interp$Time_Period_Start)),
+                                       "Num_Attr_Deaths" = num_attr_od,
+                                       "Num_Attr_Deaths_LB" = num_attr_od_LB,
+                                       "Num_Attr_Deaths_UB" = num_attr_od_UB)
+
+#sum up the total number of excess deaths attributable to the intervention
+sum(num_attr_od_wo_interpolation$Num_Attr_Deaths) #32366.12
+
+#sum up the number of excess deaths per year
+yearly_num_Attr_Deaths_wo_interpolation<-num_attr_od_wo_interpolation %>%
+  group_by("year" = year(Time_Start)) %>%
+  summarise("deaths" = sum(Num_Attr_Deaths), death_lb = sum(Num_Attr_Deaths_LB),
+            death_ub = sum(Num_Attr_Deaths_UB))
+
+summary(yearly_num_Attr_Deaths_wo_interpolation$deaths)
+
+# pdf("excess_deaths_yearly_exclude_states_12_7_20.pdf")
+ggplot(yearly_num_Attr_Deaths_wo_interpolation, aes(x = year, y = deaths)) + geom_line() + geom_point()
+# dev.off()
+
 
 #######################################################################################
 ########### Sensitivity Analysis 4: Two Year Intervention Effect ######################
@@ -1287,21 +1447,21 @@ for(state in unique(sensitivity_anlys_redefine_int_data$State)){
       #To compute the fraction, we add the number of days that are affected by an intervention
       #(from both the current prosecution and previous prosecution) and then divide by the total
       #number of days in the period:
-      #If there is no prosecution in the period i, then the start_date is the last date in the period.
-      #We subtract start_date from the last date in the period, so we will get a 0 for the number
-      #of days that are affected by a prosecution in period i. Otherwise, the start_date is the
-      #first date of a prosecution in the period.
-      #If there is no prosecution two years ago, i.e. in period i-4, then the last_date is the first
-      #date in the period. We subtract the last_date by the first date in the period, so we will get
-      #a 0 for the number of days that are affected by a prosecution from period i-4. Otherwise,
-      #the last_date is the last date of prosecution from period i-4, plus 2 years.
 
       total_len_of_pd<-as.numeric(state_data$Time_Period_End[i] - state_data$Time_Period_Start[i])
-
+      
+      #If there is no prosecution two years ago, i.e. in period i-4, then the last_date is the first
+      #date in period i. We subtract the last_date by the first date in the period, so we will get
+      #a 0 for the number of days that are affected by a prosecution from period i-4. Otherwise,
+      #the last_date is the last date of prosecution from period i-4, plus 2 years.
       len_of_past_effect <- ifelse(!is.na(state_data$first_date_in_pd[i - 4]),
                                    (state_data$last_date_in_pd[i - 4] + years(2)) - state_data$Time_Period_Start[i],
                                    0)
-
+      
+      #If there is no prosecution in the period i, then the start_date is the last date in the period i.
+      #We subtract start_date from the last date in period i, so we will get a 0 for the number
+      #of days that are affected by a prosecution in period i. Otherwise, the start_date is the
+      #first date of a prosecution in period i.
       len_of_current_effect <- ifelse(!is.na(state_data$first_date_in_pd[i]),
                                       as.numeric(state_data$Time_Period_End[i] - state_data$first_date_in_pd[i]),
                                       0)
@@ -1327,7 +1487,6 @@ for(state in unique(sensitivity_anlys_redefine_int_data$State)){
 
 
 #run the analysis on the sensitivity analysis data
-
 sensitivity_anlys_redefine_int_model<-gam(cbind(round(imputed_deaths), round(num_alive))~ State +
                                             s(Time_Period_ID, bs = "cr", by = as.factor(Region))  +
                                             Naloxone_Pharmacy_Yes_Redefined +

@@ -274,7 +274,7 @@ for(i in unique(main_analysis_plot_table$State)){
 }
 
 #plot to compare the fitted values vs observed deaths
-# pdf("./Figures/GAM_fitted_vs_actual_by_Region_3_12_21_with_int_date_full_data.pdf")
+# pdf("./Figures/GAM_fitted_vs_actual_by_Region_5_7_21_with_int_date_full_data.pdf")
 ggplot(data = main_analysis_plot_table, aes(x = Time_Date, y = Observed*100000, group = 1,
                                             color = "Observed")) +
   geom_line(aes(color = "Observed"))+ geom_point(aes(color = "Observed"), size = .5, alpha = .5) +
@@ -283,6 +283,7 @@ ggplot(data = main_analysis_plot_table, aes(x = Time_Date, y = Observed*100000, 
   geom_point(data = main_analysis_plot_table, aes(x = Time_Date, y = Fitted*100000,
                                                   color = "Estimate"),
              size = .5, alpha = .5) +
+  scale_color_manual(values = c("pink", "blue")) + 
   geom_vline(main_analysis_plot_table, mapping = aes(xintercept = Intervention_Date)) +
   facet_wrap(facets = vars(State), scales = "free_y", ncol = 5) +
   theme(axis.text.x = element_text(hjust = 1, size = 6, family = "Times"),
@@ -293,7 +294,7 @@ ggplot(data = main_analysis_plot_table, aes(x = Time_Date, y = Observed*100000, 
         strip.background = element_blank(),
         strip.text = element_text(size=8),
         panel.background = element_rect("white"),
-        legend.positio = "bottom") +
+        legend.position = "bottom") +
   labs(x = "Year", y = "Unintentional Drug Overdose Death Rates per 100,000 People",
        color = "")
 # dev.off()
@@ -1960,7 +1961,7 @@ ggplot(yearly_num_Attr_Deaths_2yr_int_lag, aes(x = year, y = deaths)) + geom_lin
 
 ###########################################################################################
 ########################## Compiled Attributable Deaths Plot###############################
-# pdf("Figures/num_attr_deaths_yearly_for_all_anlys_3_12_21_all_od.pdf")
+# pdf("Figures/num_attr_deaths_yearly_for_all_anlys_5_7_21_all_od.pdf")
 ggplot(yearly_num_Attr_Deaths_main_analysis) +
   geom_line(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "a",
                 linetype = "Estimate")) +
@@ -2035,13 +2036,13 @@ ggplot(yearly_num_Attr_Deaths_main_analysis) +
         axis.text.x = element_text(size = 10, family = "Times"),
         panel.background = element_rect("white"),
         legend.text=element_text(size=9, family = "Times"),
-        # legend.position = c(.4,.85),
-       legend.position = "bottom",
+        legend.position = c(.4,.85),
+       # legend.position = "bottom",
         legend.box="vertical", legend.margin=margin()) +
   guides(color=guide_legend(nrow=2,byrow=TRUE)) +
   labs(x = "Year", y = "Yearly Drug Overdose Deaths Attributable to DIH Prosecutions Reported in Media", color = "",
        linetype = "") +
-  scale_color_manual(values=c('black', 'red', 'green', 'blue'),
+  scale_color_manual(values=c('black', 'red', 'green', 'deepskyblue'),
                      labels = c("Main Analysis: Unintentional Drug Overdose Deaths", "All Drug Overdose Deaths",
                                 "Excluding States with At Least 75% Missing Monthly", "2 Year Effect")) +
   scale_x_date(date_labels="%Y", breaks = seq(as.Date("2000-01-01"), as.Date("2018-01-01"), by = "2 years")) +

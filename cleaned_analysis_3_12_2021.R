@@ -1961,17 +1961,26 @@ ggplot(yearly_num_Attr_Deaths_2yr_int_lag, aes(x = year, y = deaths)) + geom_lin
 
 ###########################################################################################
 ########################## Compiled Attributable Deaths Plot###############################
-# pdf("Figures/num_attr_deaths_yearly_for_all_anlys_5_7_21_all_od.pdf")
+#add color column to the datasets
+yearly_num_Attr_Deaths_main_analysis <- yearly_num_Attr_Deaths_main_analysis %>% 
+  mutate(gp_type = "a")
+yearly_num_Attr_Deaths_exclude_states <- yearly_num_Attr_Deaths_exclude_states %>%
+  mutate(gp_type = "c")
+yearly_num_Attr_Deaths_od_all <- yearly_num_Attr_Deaths_od_all %>%
+  mutate(gp_type = "b")
+yearly_num_Attr_Deaths_redefine_int <- yearly_num_Attr_Deaths_redefine_int %>%
+  mutate(gp_type = "d")
+# pdf("Figures/num_attr_deaths_yearly_for_all_anlys_5_7_21_all_od_shape.pdf")
 ggplot(yearly_num_Attr_Deaths_main_analysis) +
-  geom_line(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "a",
+  geom_line(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = gp_type,
                 linetype = "Estimate")) +
-  geom_point(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = "a"))  +
+  geom_point(aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1, color = gp_type, shape = gp_type))  +
   geom_line(yearly_num_Attr_Deaths_main_analysis,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                          color = "a", linetype = "95% Confidence Interval")) +
+                          color = gp_type, linetype = "95% Confidence Interval")) +
   geom_line(yearly_num_Attr_Deaths_main_analysis,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                          color ="a",linetype = "95% Confidence Interval")) +
+                          color =gp_type,linetype = "95% Confidence Interval")) +
   # geom_point(yearly_num_Attr_Deaths_main_analysis,
   #           mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
   #                         color = "a")) +
@@ -1980,16 +1989,16 @@ ggplot(yearly_num_Attr_Deaths_main_analysis) +
   #                         color ="a")) +
   geom_line(yearly_num_Attr_Deaths_redefine_int,
             mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                          color = "d", linetype = "Estimate")) +
+                          color = gp_type, linetype = "Estimate")) +
   geom_point(yearly_num_Attr_Deaths_redefine_int,
              mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                           color = "d"))  +
+                           color = gp_type, shape = gp_type))  +
   geom_line(yearly_num_Attr_Deaths_redefine_int,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                          color = "d", linetype = "95% Confidence Interval")) +
+                          color = gp_type, linetype = "95% Confidence Interval")) +
   geom_line(yearly_num_Attr_Deaths_redefine_int,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                          color = "d", linetype = "95% Confidence Interval")) +
+                          color = gp_type, linetype = "95% Confidence Interval")) +
   # geom_point(yearly_num_Attr_Deaths_redefine_int,
   #           mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
   #                         color = "d")) +
@@ -1997,15 +2006,15 @@ ggplot(yearly_num_Attr_Deaths_main_analysis) +
   #           mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
   #                         color = "d")) +
   geom_line(yearly_num_Attr_Deaths_od_all, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                         color = "b", linetype = "Estimate"), alpha = 0.5) +
+                                                         color = gp_type, linetype = "Estimate"), alpha = 0.5) +
   geom_point(yearly_num_Attr_Deaths_od_all, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                          color = "b"), alpha = 0.5)  +
+                                                          color = gp_type, shape = gp_type), alpha = 0.5)  +
   geom_line(yearly_num_Attr_Deaths_od_all,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                          color = "b", linetype = "95% Confidence Interval"), alpha = 0.5) +
+                          color = gp_type, linetype = "95% Confidence Interval"), alpha = 0.5) +
   geom_line(yearly_num_Attr_Deaths_od_all,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                          color = "b", linetype = "95% Confidence Interval"),  alpha = 0.5) +
+                          color = gp_type, linetype = "95% Confidence Interval"),  alpha = 0.5) +
   # geom_point(yearly_num_Attr_Deaths_od_all,
   #           mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
   #                         color = "b"), alpha = 0.5) +
@@ -2014,15 +2023,15 @@ ggplot(yearly_num_Attr_Deaths_main_analysis) +
   #                         color = "b") , alpha = 0.5) +
   geom_line(yearly_num_Attr_Deaths_exclude_states,
             mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                          color = "c", linetype = "Estimate"), alpha = 0.5) +
+                          color = gp_type, linetype = "Estimate"), alpha = 0.5) +
   geom_point(yearly_num_Attr_Deaths_exclude_states, mapping = aes(x = as.Date(as.yearmon(year)), y = deaths, group = 1,
-                                                                  color = "c"), alpha = 0.5)  +
+                                                                  color = gp_type, shape = gp_type), alpha = 0.7)  +
   geom_line(yearly_num_Attr_Deaths_exclude_states,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
-                          color = "c", linetype = "95% Confidence Interval"),alpha = 0.5) +
+                          color = gp_type, linetype = "95% Confidence Interval"),alpha = 0.7) +
   geom_line(yearly_num_Attr_Deaths_exclude_states,
             mapping = aes(x = as.Date(as.yearmon(year)), y = death_lb, group = 1,
-                          color = "c", linetype = "95% Confidence Interval"), alpha = 0.5) +
+                          color = gp_type, linetype = "95% Confidence Interval"), alpha = 0.7) +
     # geom_point(yearly_num_Attr_Deaths_exclude_states,
     #           mapping = aes(x = as.Date(as.yearmon(year)), y = death_ub, group = 1,
     #                         color = "c"),alpha = 0.5) +
@@ -2041,13 +2050,16 @@ ggplot(yearly_num_Attr_Deaths_main_analysis) +
         legend.box="vertical", legend.margin=margin()) +
   guides(color=guide_legend(nrow=2,byrow=TRUE)) +
   labs(x = "Year", y = "Yearly Drug Overdose Deaths Attributable to DIH Prosecutions Reported in Media", color = "",
-       linetype = "") +
+       linetype = "", shape = "") +
   scale_color_manual(values=c('black', 'red', 'green', 'deepskyblue'),
                      labels = c("Main Analysis: Unintentional Drug Overdose Deaths", "All Drug Overdose Deaths",
                                 "Excluding States with At Least 75% Missing Monthly", "2 Year Effect")) +
   scale_x_date(date_labels="%Y", breaks = seq(as.Date("2000-01-01"), as.Date("2018-01-01"), by = "2 years")) +
   scale_linetype_manual(values = c("Estimate" = "solid", "95% Confidence Interval" = "dashed"),
                         breaks = c("Estimate", "95% Confidence Interval")) +
-  guides(linetype = guide_legend(nrow = 1))
+  guides(linetype = guide_legend(nrow = 1)) + 
+  scale_shape_manual(values = c(16, 4, 5, 2), 
+                     labels = c("Main Analysis: Unintentional Drug Overdose Deaths", "All Drug Overdose Deaths",
+                                "Excluding States with At Least 75% Missing Monthly", "2 Year Effect"))
 
 # dev.off()

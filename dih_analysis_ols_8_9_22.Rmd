@@ -1,0 +1,3008 @@
+---
+title: "Analysis of DIH Prosecutions: 2000 to 2019, OLS"
+author: "Kelly Kung"
+date: "5/13/2022"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(echo = TRUE, root.dir = "~/OneDrive - Boston University/Research-Lok")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Set Up
+## R Code 
+```{r}
+#packages we need for this code file
+library(ggplot2)
+library(mgcv)
+library(lubridate)
+library(zoo)
+library(tidyverse)
+library(dplyr)
+library(DHARMa)
+library(mgcViz)
+library(extrafont)
+library(arm)
+loadfonts()
+library(stargazer)
+library(ellipse)
+library(dotwhisker)
+library(countreg)
+```
+
+```{r}
+#define functions we will need for analysis
+#expit function
+expit<-function(x){
+  return(exp(x)/(1 + exp(x)))
+}
+
+#logit function
+logit<-function(x){
+  return(log(x/(1 - x)))
+}
+```
+
+## Data 
+```{r}
+#read in data
+main_analysis_data<-read.csv("./Data/full_data_set_11_29_21_unintentional.csv")
+
+################################## set up data set ################################
+#add the intervention dates and time period data
+main_analysis_data$Intervention_First_Date<-as.Date(main_analysis_data$Intervention_First_Date)
+main_analysis_data$Time_Period_Start<-as.Date(main_analysis_data$Time_Period_Start)
+names(main_analysis_data)[which(colnames(main_analysis_data) == "sum_deaths")] <- "imputed_deaths"
+
+################################## set up the Regions ##############################
+#set up the regions according to Census: https://www.census.gov/geographies/reference-maps/2010/geo/2010-census-regions-and-divisions-of-the-united-states.html
+NE.name <- c("Connecticut","Maine","Massachusetts","New Hampshire",
+             "Rhode Island","Vermont","New Jersey","New York",
+             "Pennsylvania")
+
+MW.name <- c("Indiana","Illinois","Michigan","Ohio","Wisconsin",
+             "Iowa","Kansas","Minnesota","Missouri","Nebraska",
+             "North Dakota","South Dakota")
+
+S.name <- c("Delaware","District of Columbia","Florida","Georgia",
+            "Maryland","North Carolina","South Carolina","Virginia",
+            "West Virginia","Alabama","Kentucky","Mississippi",
+            "Tennessee","Arkansas","Louisiana","Oklahoma","Texas")
+
+W.name <- c("Arizona","Colorado","Idaho","New Mexico","Montana",
+            "Utah","Nevada","Wyoming","Alaska","California",
+            "Hawaii","Oregon","Washington")
+
+region.list <- list(
+  Northeast=NE.name,
+  Midwest=MW.name,
+  South=S.name,
+  West=W.name)
+
+#initialize vector with "West" and then impute the other regions for the states
+main_analysis_data$Region<-rep("West", nrow(main_analysis_data))
+for(state in unique(main_analysis_data$State)){
+  if(state %in% region.list$Northeast){
+    main_analysis_data$Region[main_analysis_data$State == state]<-"Northeast"
+  }else if(state %in% region.list$Midwest){
+    main_analysis_data$Region[main_analysis_data$State == state]<-"Midwest"
+  }else if(state %in% region.list$South){
+    main_analysis_data$Region[main_analysis_data$State == state]<-"South"
+  }
+}
+
+```
+
+# Sandwich Estimator Code
+```{r}
+#here, we estimate the variance-covariance matrix through the sandwich estimator
+#we create a function so that we don't have to keep writing the code:
+
+
+compute_sd_and_CI_linear_link <- function(Z, log_observed_y, theta, z_value = 1.96, d,
+                              return_full_cov = FALSE){
+  #this function computes the sandwich estimator for models with linear link function 
+  #Z: the data such that rows are state-time combinations and columns are the different policy measures
+  #log_observed_y: log of the observed y from the data
+  #theta: the coefficient values that need to be in order of the columns of cov_data
+  #z_value the Z-value that corresponds to the CI. We default to 95% CI so we default to 1.96
+  #d: the number of parameters for a bias correction
+  #return_full_cov: a TRUE/FALSE boolean that indicates whether to return the full variance-covariance matrix 
+  
+  #compute the middle term of the Sandwich Estimator = sum_{s,t} Z_{s,t}*Z_{s,t}^T * (log(y_{s,t}) - Z_{s,t}^T*theta)^2 
+  middle_term <- matrix(0, nrow = ncol(Z), ncol = ncol(Z))
+  for(i in 1:nrow(Z)){
+    #tcrossprod(X) = X*X^T
+    middle_term <- middle_term + tcrossprod(as.matrix(Z[i,]))*
+      as.numeric((log_observed_y[i] - t(as.matrix(Z[i,]))%*%theta)^2)
+  }
+  #compute C = sum_{s,t} Z_{s,t} * Z_{s,t}^T which is equal to Z^T * Z using matrix multiplication
+  #we compute C^{-1} by using solve()
+  C_inverse <- solve(crossprod(Z))
+  
+  #bias_term = (N)/(N-d) where N = nrow(Z)
+  bias_term <- nrow(Z)/(nrow(Z) - d)
+  
+  Sigma_hat <- C_inverse%*%(middle_term)%*%t(C_inverse)*bias_term
+  
+  #we obtain the standard errors of the coefficients by taking the square root of the diagonal of the variance-covariance matrix.
+  se_of_coefficients <- sqrt(diag(Sigma_hat))
+  
+  #find the CI for the coefficients
+  lb_coef <- theta - z_value*(sd_of_coefficients)
+  ub_coef <- theta + z_value*(sd_of_coefficients)
+  
+  #return_data_set returns the:
+  #lb_coef: lower bounds of the coefficients
+  #theta: coefficients
+  #ub_coef: upper bounds of the coefficients
+  #sd_coef = standard error of coefficients
+  return_data_set <- data.frame(lb_coef, theta, ub_coef, se_coef = se_of_coefficients)
+  
+  #if user wants the full variance-covariance matrix, we return both the return_data_set and Sigma_hat
+  if(return_full_cov){
+    return(list(return_data_set = return_data_set, var_cov = Sigma_hat))
+  }else{
+    return(return_data_set)
+  }
+}
+
+compute_sd_and_CI_logistic_link <- function(Z, observed_y, theta, z_value = 1.96, d,
+                              return_full_cov = FALSE){
+  #this function computes the sandwich estimator for models with logistic link function 
+  #Z: the data such that rows are state-time combinations and columns are the different policy measures
+  #log_observed_y: log of the observed y from the data
+  #theta: the coefficient values that need to be in order of the columns of cov_data
+  #z_value the Z-value that corresponds to the CI. We default to 95% CI so we default to 1.96
+  #d: the number of parameters for a bias correction
+  #return_full_cov: a TRUE/FALSE boolean that indicates whether to return the full variance-covariance matrix 
+  
+  #initialize the C_term and middle_term
+  C_term <- middle_term <- matrix(0, nrow = ncol(Z), ncol = ncol(Z))
+  for(i in 1:nrow(Z)){
+    #p_{s,t} = expit(z_{s,t}^T Theta)
+    p_st <- expit(t(as.matrix(Z[i,]))%*%theta)
+    
+    #middle term = sum_{s,t} Z_{s,t} * Z_{s,t}^T * (Y_{s,t} - p_{s,t})^2
+    middle_term <- middle_term + tcrossprod(as.matrix(Z[i,]))*
+      as.numeric((observed_y[i] - p_st)^2)
+    
+    #C_term = sum_{s,t} Z_{s,t} * Z_{s,t}^T * (p_{s,t}*(1-p_{s,t})) 
+    C_term <- C_term + tcrossprod(as.matrix(Z[i,]))*as.numeric(p_st*(1 - p_st))
+  }
+
+  C_inverse <- solve(C_term)
+  
+  #bias_term = (N)/(N-d) where N = nrow(Z)
+  bias_term <- nrow(Z)/(nrow(Z) - d)
+  
+  Sigma_hat <- C_inverse%*%as.matrix(middle_term)%*%t(C_inverse)*bias_term
+
+  #we obtain the standard errors by taking the square root of the diagonal of the variance-covariance matrix.
+  se_of_coefficients <- sqrt(diag(Sigma_hat))
+
+  #find the CI for the coefficients
+  lb_coef <- theta - z_value*(se_of_coefficients)
+  ub_coef <- theta + z_value*(se_of_coefficients)
+  
+  #return_data_set returns the:
+  #lb_coef: lower bounds of the coefficients
+  #theta: coefficients
+  #ub_coef: upper bounds of the coefficients
+  #exp_lb: exponential of lower bounds of the coefficients
+  #exp_coef = exponential of theta
+  #exp_ub: exponential of upper bounds of the coefficients
+  #sd_coef = standard error of coefficients
+  return_data_set <- data.frame(lb_coef, 
+                                theta, 
+                                ub_coef,
+                                exp_lb = exp(lb_coef), 
+                                exp_coef = exp(theta),
+                                exp_ub = exp(ub_coef), 
+                                se_coef = se_of_coefficients)
+
+  
+  #if user wants the full variance-covariance matrix, we return both the return_data_set and Sigma_hat
+  if(return_full_cov){
+    return(list(return_data_set = return_data_set, var_cov = Sigma_hat))
+  }else{
+    return(return_data_set)
+  }
+}
+
+
+
+```
+
+# Attributable Deaths Computation
+
+```{r}
+attr_death_compute <- function(data, coef_data,  tx_name = NULL, 
+                               var_cov_mat_beta = NULL, prob_of_od_var = "prop_dead"){
+  attr_table <- data.frame(matrix(NA, nrow = unique(data$Time_Period_ID), ncol = 4)) 
+  #filter data so that it's only states where there was treatment
+  treated_data <- data %>%
+    filter(Intervention_Redefined > 0)
+  
+  for(time in unique(treated_data$Time_Period_ID)){
+    #filter treated_data to time period t
+    time_data <- treated_data %>%
+      filter(Time_Period_ID == time)
+    
+    #obtain the population
+    pop <- time_data$population
+    
+    #obtain the estimated probability had intervention not occurred
+    #here, we compute x^T*beta where x is a vector of the covariates and beta is the corresponding coefficients
+    est_prob_no_int <- time_data[,prob_of_od_var]*exp(- as.matrix(time_data[,tx_name])%*%as.matrix(coef_data[tx_name, "estimate"]))
+    
+    #estimated number of OD had intervention not occurred
+    n_od_no_int <- pop*est_prob_no_int
+    
+    #obtain LB and UB
+    if(length(tx_name) == 1){
+      #if there is only one variable corresponding to treatment, we don't need to account for covariances
+      est_prob_no_int_lb <- time_data[,prob_of_od_var]*exp(- as.matrix(time_data[,tx_name])%*%as.matrix(coef_data[tx_name, "conf.low"]))
+      n_attr_od_lb <- sum(pop*est_prob_no_int_lb) - sum(time_data$imputed_deaths)
+      
+      est_prob_no_int_ub <- time_data[,prob_of_od_var]*exp(-as.matrix(time_data[,tx_name])%*%as.matrix(coef_data[tx_name, "conf.high"]))
+      n_attr_od_ub <- sum(pop*est_prob_no_int_ub) - sum(time_data$imputed_deaths)
+    }else{
+      #otherwise, if there are more than 1 treatment parameters, we need to account for covariances
+      #here we assume its two treatment parameters 
+      jacobian_first_entry <- sum(time_data$population*time_data[,prob_of_od_var]*
+                                    exp(-as.matrix(time_data[,tx_name])%*%as.matrix(coef_data[tx_name,"estimate"]))*
+                                    time_data[,tx_name[1]])
+      jacobian_second_entry <- sum(time_data$population*time_data[,prob_of_od_var]*
+                                     exp(-as.matrix(time_data[,tx_name])%*%as.matrix(coef_data[tx_name,"estimate"]))*
+                                     time_data[,tx_name[2]])
+      
+      jacobian_mat <- matrix(c(jacobian_first_entry, jacobian_second_entry), nrow = 1)
+      
+      computed_sd <- sqrt(tcrossprod(jacobian_mat%*%var_cov_mat_beta, jacobian_mat)) 
+      n_attr_od_lb <- sum(n_od_no_int - time_data$imputed_deaths) - 1.96*computed_sd
+      n_attr_od_ub <- (sum(n_od_no_int - time_data$imputed_deaths)) + 1.96*computed_sd
+      
+    }
+    
+    attr_table[time,] <- c(time, sum(n_od_no_int - time_data$imputed_deaths), 
+                           (n_attr_od_lb) , 
+                           (n_attr_od_ub) )
+    
+    
+  }
+  colnames(attr_table) <- c("Time_Period", "attr_deaths", "attr_deaths_lb", "attr_deaths_ub")
+  attr_table
+}
+
+
+```
+
+# Event Study Data Creation
+```{r}
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+#create the dataset for the event study to check for pre-trend analysis
+time_data_int <- main_analysis_data %>%
+  #group by the state
+  group_by(State) %>%
+  #find the time interval ID for the intervention time
+  summarise(intervention_time_id = ifelse(floor_date(Intervention_First_Date, "6 months") == Time_Period_Start, Time_Period_ID, NA)) %>%
+  #filter out the other time periods that aren't the intervention date
+  filter(!is.na(intervention_time_id))
+
+#merge the time_data_int with the main dataset
+merged_main_time_data_int <- merge(main_analysis_data, time_data_int, by = "State", all.x = TRUE)
+
+#create the columns that associate with the periods before the intervention
+#the max number of periods before the intervention is determined by the maximum time period of the intervention
+neg_periods_df <- sapply(1:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 1),
+                         #the indicator for x periods before intervention is equal to 1 if the time ID of intervention minus time ID is equal to x
+                         function(x){ifelse(merged_main_time_data_int$intervention_time_id - 
+                                              merged_main_time_data_int$Time_Period_ID == x, 1, 0)})
+
+#create the column names
+colnames(neg_periods_df) <- sapply(1:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 1), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")})
+#add in the state and time ID columns
+neg_periods_df <- cbind(neg_periods_df, "State" = merged_main_time_data_int$State, 
+                        "Time_Period_ID" = merged_main_time_data_int$Time_Period_ID)
+#for Hawaii, impute a 0 because it is NA right now
+neg_periods_df[neg_periods_df[,"State"] == "Hawaii", 1:34] <- 0
+
+#create the columns that associate with the periods after the intervention
+#the max number of periods after the intervention is determined by the maximum Time ID minus the minus time period of the intervention
+#the period 0 is associated with intervention time
+pos_periods_df <- sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                         function(x){ifelse(merged_main_time_data_int$Time_Period_ID - 
+                                              merged_main_time_data_int$intervention_time_id == x, 1, 0)})
+#create the column names
+colnames(pos_periods_df) <- sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                                        min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})
+#add in the state and time ID columns
+pos_periods_df <- cbind(pos_periods_df, "State" = merged_main_time_data_int$State, 
+                        "Time_Period_ID" = merged_main_time_data_int$Time_Period_ID)
+#for Hawaii, impute a 0 because it is NA right now
+pos_periods_df[pos_periods_df[,"State"] == "Hawaii", 1:40] <- 0
+
+#merge the columns of indicators for before and after the intervention with the main analysis data to create the dataset for event study
+sensitivity_anlys_event_study_data <- merge(main_analysis_data, 
+                                            neg_periods_df, by = c("State", "Time_Period_ID"))
+
+sensitivity_anlys_event_study_data <- merge(sensitivity_anlys_event_study_data, 
+                                            pos_periods_df, by = c("State", "Time_Period_ID"))
+#change the indicator values to numeric type 
+neg_1_index <- which(colnames(sensitivity_anlys_event_study_data) == "neg_1_pd")
+pos_39_index <- which(colnames(sensitivity_anlys_event_study_data) == "pos_39_pd")
+
+sensitivity_anlys_event_study_data[, neg_1_index:pos_39_index] <- apply(sensitivity_anlys_event_study_data[, neg_1_index:pos_39_index], 
+                                                                        2, as.numeric)
+
+```
+
+#OLS not GAM
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+#add the intervention variable as a measure of number of states with DIH prosecution
+main_analysis_data <- main_analysis_data %>%
+  group_by(Time_Period_Start) %>%
+  mutate(num_states_w_intervention = sum(Intervention_Redefined))
+
+#fit an OLS with smoothed time effects
+main_analysis_model_log_not_gam<-lm(log(prop_dead)~ State +
+                                             # s(Time_Period_ID, bs = "cr", by = as.factor(Region)) +
+                                               Time_Period_ID:as.factor(Region) + 
+                                             Naloxone_Pharmacy_Yes_Redefined +
+                                             Naloxone_Pharmacy_No_Redefined +
+                                             Medical_Marijuana_Redefined +
+                                             Recreational_Marijuana_Redefined +
+                                             GSL_Redefined +
+                                             PDMP_Redefined +
+                                             Medicaid_Expansion_Redefined +
+                                             Intervention_Redefined +
+                                             num_states_w_intervention,
+                                           data = main_analysis_data)
+
+summary(main_analysis_model_log_not_gam)
+
+#examine fitted values
+summary(fitted(main_analysis_model_log_not_gam))
+hist(fitted(main_analysis_model_log_not_gam))
+
+#smoothed effects
+par(mfrow = c(2,2))
+plot(main_analysis_model_log_not_gam)
+par(mfrow = c(1,1))
+```
+
+## Sandwich Estimator: Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_not_gam <- model.matrix(main_analysis_model_log_not_gam)
+
+#estimate the 95% CI and SD
+coefficient_values_log_not_gam <- coef(main_analysis_model_log_not_gam)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_log_not_gam <- compute_sd_and_CI_linear_link(full_df_w_basis_functions_log_not_gam,
+                                                               log(main_analysis_data$prop_dead),
+                                                               coefficient_values_log_not_gam,
+                                                               k = ncol(full_df_w_basis_functions_log_not_gam))
+# format(round(main_analysis_sd_and_ci_log_, 3), nsmall = 3)
+
+colnames(main_analysis_sd_and_ci_log_not_gam) <- c("conf.low", "estimate", "conf.high", "sd")
+main_analysis_sd_and_ci_log_not_gam$term <- rownames(main_analysis_sd_and_ci_log_not_gam)
+
+
+main_analysis_sd_and_ci_log_not_gam$ci_95 <- 
+  paste("95% CI = (", format(round(main_analysis_sd_and_ci_log_not_gam$conf.low, 3), nsmall = 3), ", ", 
+        format(round(main_analysis_sd_and_ci_log_not_gam$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(main_analysis_sd_and_ci_log_not_gam[51:59,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       Exposure Intervention") + 
+  scale_color_grey()    + 
+  geom_text(main_analysis_sd_and_ci_log_not_gam[51:59,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 9:1), size = 3) + 
+  geom_text(main_analysis_sd_and_ci_log_not_gam[51:59,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 9:1), size = 3) +
+  xlim(-.3, 1.1)
+```
+
+```{r}
+main_analysis_coef_of_interest_RR_not_gam <- main_analysis_sd_and_ci_log_not_gam[51:59,]
+main_analysis_coef_of_interest_RR_not_gam$est_RR <- round(exp(main_analysis_coef_of_interest_RR_not_gam$estimate), 3)
+main_analysis_coef_of_interest_RR_not_gam$est_RR_lb <- round(exp(main_analysis_coef_of_interest_RR_not_gam$conf.low), 3)
+main_analysis_coef_of_interest_RR_not_gam$est_RR_ub <- round(exp(main_analysis_coef_of_interest_RR_not_gam$conf.high), 3)
+
+main_analysis_coef_of_interest_RR_not_gam[,c("est_RR", "est_RR_lb", "est_RR_ub")]
+
+```
+
+
+# OLS Model Main Analysis With Smoothed Time Effects With Log Proportion 
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+#add the intervention variable as a measure of number of states with DIH prosecution
+main_analysis_data <- main_analysis_data %>%
+  group_by(Time_Period_Start) %>%
+  mutate(num_states_w_intervention = sum(Intervention_Redefined))
+
+#fit an OLS with smoothed time effects
+main_analysis_model_log_smoothed_time<-gam(log(prop_dead)~ State +
+                                             s(Time_Period_ID, bs = "cr", by = as.factor(Region)) +
+                                             Naloxone_Pharmacy_Yes_Redefined +
+                                             Naloxone_Pharmacy_No_Redefined +
+                                             Medical_Marijuana_Redefined +
+                                             Recreational_Marijuana_Redefined +
+                                             GSL_Redefined +
+                                             PDMP_Redefined +
+                                             Medicaid_Expansion_Redefined +
+                                             Intervention_Redefined +
+                                             num_states_w_intervention,
+                                           data = main_analysis_data)
+
+summary(main_analysis_model_log_smoothed_time)
+gam.check(main_analysis_model_log_smoothed_time, page = 1)
+
+#examine fitted values
+summary(fitted(main_analysis_model_log_smoothed_time))
+hist(fitted(main_analysis_model_log_smoothed_time))
+
+#smoothed effects
+plot(main_analysis_model_log_smoothed_time, pages = 1)
+```
+
+## Sandwich Estimator: Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_smoothed_time <- as.matrix(data.frame(predict(main_analysis_model_log_smoothed_time, type = "lpmatrix")))
+
+#estimate the 95% CI and SD
+coefficient_values_log_smoothed_time <- coef(main_analysis_model_log_smoothed_time)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_log_smoothed_time <- compute_sd_and_CI_linear_link(full_df_w_basis_functions_log_smoothed_time,
+                                                               log(main_analysis_data$prop_dead),
+                                                               coefficient_values_log_smoothed_time,
+                                                               k = ncol(full_df_w_basis_functions_log_smoothed_time))
+# format(round(main_analysis_sd_and_ci_log_smoothed_time, 3), nsmall = 3)
+
+colnames(main_analysis_sd_and_ci_log_smoothed_time) <- c("conf.low", "estimate", "conf.high", "sd")
+main_analysis_sd_and_ci_log_smoothed_time$term <- rownames(main_analysis_sd_and_ci_log_smoothed_time)
+
+
+main_analysis_sd_and_ci_log_smoothed_time$ci_95 <- 
+  paste("95% CI = (", format(round(main_analysis_sd_and_ci_log_smoothed_time$conf.low, 3), nsmall = 3), ", ", 
+        format(round(main_analysis_sd_and_ci_log_smoothed_time$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(main_analysis_sd_and_ci_log_smoothed_time[51:59,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       Exposure Intervention") + 
+  scale_color_grey()    + 
+  geom_text(main_analysis_sd_and_ci_log_smoothed_time[51:59,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 9:1), size = 3) + 
+  geom_text(main_analysis_sd_and_ci_log_smoothed_time[51:59,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 9:1), size = 3) +
+  xlim(-.3, 1.1)
+```
+
+```{r}
+main_analysis_coef_of_interest_RR <- main_analysis_sd_and_ci_log_smoothed_time[51:59,]
+main_analysis_coef_of_interest_RR$est_RR <- round(exp(main_analysis_coef_of_interest_RR$estimate), 3)
+main_analysis_coef_of_interest_RR$est_RR_lb <- round(exp(main_analysis_coef_of_interest_RR$conf.low), 3)
+main_analysis_coef_of_interest_RR$est_RR_ub <- round(exp(main_analysis_coef_of_interest_RR$conf.high), 3)
+
+main_analysis_coef_of_interest_RR[,c("est_RR", "est_RR_lb", "est_RR_ub")]
+
+```
+
+## Attributable Deaths
+```{r}
+date_data <- main_analysis_data[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_smoothed_time <- attr_death_compute(main_analysis_data, main_analysis_sd_and_ci_log_smoothed_time, 
+                                                        tx_name = "Intervention_Redefined")
+attr_deaths_est_log_smoothed_time <- merge(attr_deaths_est_log_smoothed_time, date_data, by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_smoothed_time, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+
+
+
+## Event Study: All Periods
+### Model Fitting
+```{r}
+#create a formula for the gam model which includes the state effects, smoothed time effects, policy measures, 
+#the periods before the intervention (excluding 1 period and 34 periods before intervention)
+#the intervention period, and the periods after the intervention
+
+formula_event_study_log_smoothed_time <- formula(paste("log(prop_dead) ~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                           paste(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)-2), 
+                                                        function(x)paste("neg_", x, "_pd", sep = "")), collapse = "+"),
+                                           "+",
+                                           paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                                                             min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                                                        function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_event_study_model_log_smoothed_time<-gam(formula_event_study_log_smoothed_time,
+                                                           data = sensitivity_anlys_event_study_data)
+
+# summary(sensitivity_anlys_event_study_model_log_smoothed_time)
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_event_study_log_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_event_study_model_log_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_event_study_log_smoothed_time <- coef(sensitivity_anlys_event_study_model_log_smoothed_time)
+#type = "response" to get the estimated probabilities
+sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time <-
+  compute_sd_and_CI_linear_link(as.matrix(full_df_w_basis_functions_sensitivity_anlys_event_study_log_smoothed_time), 
+                    log(sensitivity_anlys_event_study_data$prop_dead),
+                    coefficient_values_sensitivity_anlys_event_study_log_smoothed_time,
+                    k = ncol(full_df_w_basis_functions_sensitivity_anlys_event_study_log_smoothed_time))
+(sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time)
+# write.csv(format(round(sensitivity_anlys_event_study_sd_and_ci, 3), nsmall = 3), "./Data/event_study_coef_and_ci.csv")
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_log_smoothed_time <- sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time %>%
+  mutate(term = rownames(sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                            function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                                 min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                            function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_log_smoothed_time) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_log_smoothed_time, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                                 min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                              function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                              function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Relative to Time of Treatment", 
+       x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+
+plot_event_study_log_smoothed_time_paper <- plot_event_study_log_smoothed_time 
+plot_event_study_log_smoothed_time_paper$term <- ifelse(grepl("pos_", plot_event_study_log_smoothed_time_paper$term), 
+                                                        paste("+", extract_numeric(plot_event_study_log_smoothed_time_paper$term), 
+                                                              sep = ""), 
+                                                        paste("-", extract_numeric(plot_event_study_log_smoothed_time_paper$term), 
+                                                              sep = ""))
+
+# pdf("./Figures/pre_tx_trend_ols_model_5_13_22.pdf", width = 5, height = 5)
+dwplot(plot_event_study_log_smoothed_time_paper, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                                 min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                              function(x){paste("+", x, sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                              function(x){paste("-", x, sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(size = 5, angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Relative to Time of Treatment", 
+       x = "Coefficients and 95% Confidence Intervals") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+# dev.off()
+
+```
+
+
+## Analysis With Only Periods After Treatment
+```{r}
+formula_post_tx_log_smoothed_time <- formula(paste("log(prop_dead)~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                           paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                                                             min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                                                        function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model_log_smoothed_time<-gam(formula_post_tx_log_smoothed_time,
+                                                       data = sensitivity_anlys_event_study_data)
+# summary(sensitivity_anlys_post_tx_model_log_smoothed_time)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_post_tx_model_log_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time <- coef(sensitivity_anlys_post_tx_model_log_smoothed_time)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time <- 
+  compute_sd_and_CI_linear_link(as.matrix(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time), 
+                    log(sensitivity_anlys_event_study_data$prop_dead),
+                    coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time, 
+                    k = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time))
+# sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time
+
+
+
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_smoothed_time <- sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                                 min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                            function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_smoothed_time) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_smoothed_time$num_states <- sapply(plot_post_tx_log_smoothed_time$term,
+                                                    function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_log_smoothed_time, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                                  min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                              function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() 
+# geom_vline(aes(xintercept = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+# geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), y = 12, 
+#           x = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"] + 0.1), color = "red")
+# geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+
+
+```
+
+## Analysis With Linear Effects Periods After Treatment 
+```{r}
+#use this function to compute the cumulative sum, but resets the sum if the variable was 0
+compute_cumsum = function(x){
+  cs = cumsum(x)
+  cs - cummax((x == 0) * cs)
+}
+sensitivity_anlys_event_study_data_lin_post_tx <- sensitivity_anlys_event_study_data %>%
+  arrange(State, Time_Period_ID) %>%
+  group_by(State) %>%
+  mutate(sum_tx_periods = pos_0_pd + pos_1_pd + pos_2_pd + pos_3_pd + 
+           pos_4_pd + pos_5_pd + pos_6_pd + pos_7_pd + pos_8_pd + pos_9_pd + 
+           pos_10_pd + pos_11_pd + pos_12_pd + pos_13_pd + pos_14_pd + 
+           pos_15_pd + pos_16_pd + pos_17_pd + pos_18_pd + pos_19_pd + 
+           pos_20_pd + pos_21_pd + pos_22_pd + pos_23_pd + pos_24_pd + 
+           pos_25_pd + pos_26_pd + pos_27_pd + pos_28_pd + pos_29_pd + 
+           pos_30_pd + pos_31_pd + pos_32_pd + pos_33_pd + pos_34_pd + 
+           pos_35_pd + pos_36_pd + pos_37_pd + pos_38_pd + pos_39_pd,
+         time_after_tx = cumsum(sum_tx_periods),
+         num_pd_w_tx = compute_cumsum(Intervention_Redefined ),
+         num_pd_w_naloxone_yes = compute_cumsum(Naloxone_Pharmacy_Yes_Redefined),
+         num_pd_w_naloxone_no = compute_cumsum(Naloxone_Pharmacy_No_Redefined),
+         num_pd_w_med_marijuana = compute_cumsum(Medical_Marijuana_Redefined),
+         num_pd_w_rec_marijuana = compute_cumsum(Recreational_Marijuana_Redefined),
+         num_pd_w_gsl = compute_cumsum(GSL_Redefined),
+         num_pd_w_pdmp = compute_cumsum(PDMP_Redefined),
+         num_pd_w_medicaid = compute_cumsum(Medicaid_Expansion_Redefined),
+         lag_num_pd_w_tx = lag(num_pd_w_tx),
+         lag_num_pd_w_naloxone_yes = lag(num_pd_w_naloxone_yes),
+         lag_num_pd_w_naloxone_no = lag(num_pd_w_naloxone_no),
+         lag_num_pd_w_med_marijuana = lag(num_pd_w_med_marijuana),
+         lag_num_pd_w_rec_marijuana = lag(num_pd_w_rec_marijuana),
+         lag_num_pd_w_gsl = lag(num_pd_w_gsl),
+         lag_num_pd_w_pdmp = lag(num_pd_w_pdmp),
+         lag_num_pd_w_medicaid = lag(num_pd_w_medicaid)) #lag so that intercept = effect when tx first occurs
+
+#fill in a 0 for the NAs so we keep all the data and at most this will be 0
+#also fill in a 0 for the linear effect of intervention for the first period
+
+sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_tx[
+  sensitivity_anlys_event_study_data_lin_post_tx$Intervention_Redefined < 1] <- 
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_naloxone_yes[
+    sensitivity_anlys_event_study_data_lin_post_tx$Naloxone_Pharmacy_Yes_Redefined < 1]<-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_naloxone_no[
+    sensitivity_anlys_event_study_data_lin_post_tx$Naloxone_Pharmacy_No_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_med_marijuana[
+    sensitivity_anlys_event_study_data_lin_post_tx$Medical_Marijuana_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_rec_marijuana[
+    sensitivity_anlys_event_study_data_lin_post_tx$Recreational_Marijuana_Redefined < 1] <- 
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_gsl[
+    sensitivity_anlys_event_study_data_lin_post_tx$GSL_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_pdmp[
+    sensitivity_anlys_event_study_data_lin_post_tx$PDMP_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_medicaid[
+    sensitivity_anlys_event_study_data_lin_post_tx$Medicaid_Expansion_Redefined < 1] <-0
+
+
+
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_log_smoothed_time<-gam(log(prop_dead)~ State +
+                                                             s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                             Naloxone_Pharmacy_Yes_Redefined + 
+                                                             lag_num_pd_w_naloxone_yes +
+                                                             Naloxone_Pharmacy_No_Redefined + 
+                                                             lag_num_pd_w_naloxone_no +
+                                                             Medical_Marijuana_Redefined + 
+                                                             lag_num_pd_w_med_marijuana +
+                                                             Recreational_Marijuana_Redefined + 
+                                                             lag_num_pd_w_rec_marijuana +
+                                                             GSL_Redefined + 
+                                                             lag_num_pd_w_gsl +
+                                                             PDMP_Redefined + 
+                                                             lag_num_pd_w_pdmp +
+                                                             Medicaid_Expansion_Redefined +
+                                                             lag_num_pd_w_medicaid +
+                                                             Intervention_Redefined +
+                                                             lag_num_pd_w_tx,
+                                                           data = sensitivity_anlys_event_study_data_lin_post_tx)
+summary(sensitivity_anlys_lin_post_tx_model_log_smoothed_time)
+
+plot(sensitivity_anlys_lin_post_tx_model_log_smoothed_time, pages = 1)
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_lin_post_tx_model_log_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_lin_post_tx_log_smoothed_time <- coef(sensitivity_anlys_lin_post_tx_model_log_smoothed_time)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time_w_cov <- 
+  compute_sd_and_CI_linear_link(as.matrix(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_smoothed_time), 
+                    log(sensitivity_anlys_event_study_data$prop_dead),
+                    coefficient_values_sensitivity_anlys_lin_post_tx_log_smoothed_time, 
+                    k = ncol(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_smoothed_time),
+                    print_full_cov = TRUE)
+# format(round(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time, 3), nsmall = 3)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time <- sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time_w_cov[[1]]
+colnames(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time) <- c("conf.low", "estimate", "conf.high", "sd")
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term <- rownames(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$ci_95 <- 
+  paste("95% CI = (", format(round(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       Linear Intervention") + 
+  scale_color_grey() + 
+  geom_text(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.5, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_log_all_yr <- sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time[51:66,]
+table_of_RR_lin_eff_log_all_yr$estimate <- round(exp(table_of_RR_lin_eff_log_all_yr$estimate), 4)
+table_of_RR_lin_eff_log_all_yr$conf.low <- exp(table_of_RR_lin_eff_log_all_yr$conf.low)
+table_of_RR_lin_eff_log_all_yr$conf.high <- exp(table_of_RR_lin_eff_log_all_yr$conf.high)
+table_of_RR_lin_eff_log_all_yr$ci_95 <- paste("95% CI = (", 
+                                              format(round(table_of_RR_lin_eff_log_all_yr$conf.low, 4), nsmall = 4), ", ", 
+                                              format(round(table_of_RR_lin_eff_log_all_yr$conf.high, 4), nsmall = 4), ")", sep = "")
+
+# write.csv(table_of_RR_lin_eff_log_all_yr, "./Data/table_of_RR_lin_eff_log_all_yr_5_13_22.csv")
+table_of_RR_lin_eff_log_all_yr
+```
+
+### Attributable Deaths
+```{r}
+date_data <- sensitivity_anlys_event_study_data_lin_post_tx[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+var_cov_mat_beta_lin_tx <- as.matrix(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time_w_cov[[2]][
+  c("Intervention_Redefined", "lag_num_pd_w_tx"), c("Intervention_Redefined", "lag_num_pd_w_tx")])
+
+
+attr_deaths_est_log_smoothed_time_lin_post <- attr_death_compute(sensitivity_anlys_event_study_data_lin_post_tx,
+                                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time,
+                                                                 tx_name = c("Intervention_Redefined", "lag_num_pd_w_tx"),
+                                                                 var_cov_mat_beta_lin_tx)
+
+attr_deaths_est_log_smoothed_time_lin_post <- merge(attr_deaths_est_log_smoothed_time_lin_post, date_data, 
+                                                    by.x = "Time_Period", by.y = "Time_Period_ID")
+
+attr_deaths_est_log_smoothed_time_lin_post_summary <- attr_deaths_est_log_smoothed_time_lin_post %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(total_attr_deaths = sum(attr_deaths),
+            total_attr_deaths_lb = sum(attr_deaths_lb),
+            total_attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$total_attr_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$total_attr_deaths_lb)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$total_attr_deaths_ub)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$total_attr_deaths)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$total_attr_deaths_lb)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$total_attr_deaths_ub)/sum(main_analysis_data$imputed_deaths)
+
+ggplot(attr_deaths_est_log_smoothed_time_lin_post_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = total_attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = total_attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = total_attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Yearly Number of Lives Saved",
+       title = "Estimated Number of Lives Saved Per Year,
+       Using Smoothed Time Effects,
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = c(.2, .7)) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+
+#overall national overdose deaths
+national_od <- sensitivity_anlys_event_study_data_lin_post_tx %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(total_od = sum(imputed_deaths),
+            total_od_prob = sum(imputed_deaths)/sum(population),
+            total_pop = sum(population))
+
+
+national_od <- merge(national_od, attr_deaths_est_log_smoothed_time_lin_post_summary, by = "year")
+
+ggplot(national_od, aes(x = year)) + 
+  geom_line(aes(y = total_od, color = "Oberved OD")) +
+  geom_line(aes(y = total_attr_deaths, color = "Lives Saved", linetype = "Estimate")) + 
+  geom_line(aes(y = total_attr_deaths_lb, color = "Lives Saved", linetype = "95% CI")) + 
+  geom_line(aes(y = total_attr_deaths_ub, color = "Lives Saved", linetype = "95% CI")) + 
+  geom_line(aes(y = total_attr_deaths + total_od, 
+                color = "Potential Number of Deaths Had There Not Been DIH Prosecutions")) + 
+  labs(x = "Date", y = "People",
+       title = "Number of OD Deaths and Estimated Number of Lives Saved in Each Year",
+       color = "", linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+```
+
+```{r}
+pdf("./Figures/lives_saved_ols_lin_tx_all_time_5_13_22.pdf", height = 5, width = 5)
+ggplot(attr_deaths_est_log_smoothed_time_lin_post_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = total_attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = total_attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = total_attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Year", y = "Yeary Number of Lives Saved",
+       # title = "Estimated Number of Lives Saved Per Year,
+       # Using Smoothed Time Effects, 
+       # Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = c(.2, .75)) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+dev.off()
+
+pdf("./Figures/lives_saved_and_est_od_ols_lin_tx_all_time_5_13_22.pdf")
+ggplot(national_od, aes(x = year)) + 
+  geom_line(aes(y = total_od, color = "Oberved OD")) +
+  geom_line(aes(y = total_attr_deaths, color = "Lives Saved", linetype = "Estimate")) + 
+  geom_line(aes(y = total_attr_deaths_lb, color = "Lives Saved", linetype = "95% CI")) + 
+  geom_line(aes(y = total_attr_deaths_ub, color = "Lives Saved", linetype = "95% CI")) + 
+  geom_line(aes(y = total_attr_deaths + total_od, 
+                color = "Potential Number of Deaths Had There Not Been DIH Prosecutions")) + 
+  labs(x = "Date", y = "People",
+       # title = "Number of OD Deaths and Estimated Number of Lives Saved in Each Year",
+       color = "", linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+
+dev.off()
+```
+
+## Analysis With Only Periods After Treatment Subset Periods
+```{r}
+#run the gam model
+data_subset <- sensitivity_anlys_event_study_data_lin_post_tx[sensitivity_anlys_event_study_data_lin_post_tx$Time_Period_ID <= 30,]
+sensitivity_anlys_post_tx_model_log_smoothed_time_subset<-gam(log(prop_dead)~ State +
+                                                                s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                Naloxone_Pharmacy_Yes_Redefined + 
+                                                                lag_num_pd_w_naloxone_yes +
+                                                                Naloxone_Pharmacy_No_Redefined + 
+                                                                lag_num_pd_w_naloxone_no +
+                                                                Medical_Marijuana_Redefined + 
+                                                                lag_num_pd_w_med_marijuana +
+                                                                Recreational_Marijuana_Redefined + 
+                                                                lag_num_pd_w_rec_marijuana +
+                                                                GSL_Redefined + 
+                                                                lag_num_pd_w_gsl +
+                                                                PDMP_Redefined + 
+                                                                lag_num_pd_w_pdmp +
+                                                                Medicaid_Expansion_Redefined +
+                                                                lag_num_pd_w_medicaid +
+                                                                Intervention_Redefined +
+                                                                lag_num_pd_w_tx,
+                                                              data = data_subset)
+summary(sensitivity_anlys_post_tx_model_log_smoothed_time_subset)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time_subset <-
+  data.frame(predict(sensitivity_anlys_post_tx_model_log_smoothed_time_subset, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time_subset <- coef(sensitivity_anlys_post_tx_model_log_smoothed_time_subset)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset_w_cov <- 
+  compute_sd_and_CI_linear_link(as.matrix(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time_subset), 
+                    log(data_subset$prop_dead),
+                    coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time_subset,
+                    k = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time_subset),
+                    print_full_cov = TRUE)
+# sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset
+
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset <- sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset_w_cov[[1]]
+colnames(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset) <- c("conf.low", "estimate", "conf.high", "sd")
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term <- rownames(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$ci_95 <- 
+  paste("95% CI = (", format(round(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       Linear Intervention, Subset Data") + 
+  scale_color_grey()  + 
+  geom_text(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.5, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_log_all_yr_subset <- sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset[51:66,]
+table_of_RR_lin_eff_log_all_yr_subset$estimate <- round(exp(table_of_RR_lin_eff_log_all_yr_subset$estimate), 3)
+table_of_RR_lin_eff_log_all_yr_subset$conf.low <- exp(table_of_RR_lin_eff_log_all_yr_subset$conf.low)
+table_of_RR_lin_eff_log_all_yr_subset$conf.high <- exp(table_of_RR_lin_eff_log_all_yr_subset$conf.high)
+table_of_RR_lin_eff_log_all_yr_subset$ci_95 <- paste("95% CI = (", 
+                                                     format(round(table_of_RR_lin_eff_log_all_yr_subset$conf.low, 3), nsmall = 3), ", ", 
+                                                     format(round(table_of_RR_lin_eff_log_all_yr_subset$conf.high, 3), nsmall = 3), ")",
+                                                     sep = "")
+
+# write.csv(table_of_RR_lin_eff_log_all_yr_subset, "./Data/table_of_RR_lin_eff_log_all_yr_subset_5_13_22.csv")
+table_of_RR_lin_eff_log_all_yr_subset
+```
+
+### Attributable Deaths
+```{r}
+date_data_subset <- data_subset[, c("Time_Period_ID", "Time_Period_Start")]
+date_data_subset <- date_data_subset[!duplicated(date_data_subset),]
+var_cov_mat_beta_lin_tx_subset <- as.matrix(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset_w_cov[[2]][
+  c("Intervention_Redefined", "lag_num_pd_w_tx"), c("Intervention_Redefined", "lag_num_pd_w_tx")])
+attr_deaths_est_log_smoothed_time_lin_post_subset <- attr_death_compute(data_subset,
+                                                                        sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset, 
+                                                                        tx_name = c("Intervention_Redefined", "lag_num_pd_w_tx"),
+                                                                        var_cov_mat_beta_lin_tx_subset)
+attr_deaths_est_log_smoothed_time_lin_post_subset <- merge(attr_deaths_est_log_smoothed_time_lin_post_subset, date_data_subset, 
+                                                           by.x = "Time_Period", by.y = "Time_Period_ID")
+
+
+attr_deaths_est_log_smoothed_time_lin_post_subset_summary <- attr_deaths_est_log_smoothed_time_lin_post_subset %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(total_attr_deaths = sum(attr_deaths),
+            total_attr_deaths_lb = sum(attr_deaths_lb),
+            total_attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_log_smoothed_time_lin_post_subset_summary$total_attr_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_subset_summary$total_attr_deaths_lb)
+sum(attr_deaths_est_log_smoothed_time_lin_post_subset_summary$total_attr_deaths_ub)
+sum(attr_deaths_est_log_smoothed_time_lin_post_subset_summary$total_attr_deaths)/sum(data_subset$imputed_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_subset_summary$total_attr_deaths_lb)/sum(data_subset$imputed_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_subset_summary$total_attr_deaths_ub)/sum(data_subset$imputed_deaths)
+
+
+ggplot(attr_deaths_est_log_smoothed_time_lin_post_subset_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = total_attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = total_attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = total_attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Per Year 
+       Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+
+
+ggplot() + 
+  geom_line(attr_deaths_est_log_smoothed_time_lin_post_summary, 
+            mapping = aes(x = year, y = total_attr_deaths, linetype = "Estimate",
+                          color = "Full Dataset")) + 
+  geom_line(attr_deaths_est_log_smoothed_time_lin_post_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_lb, linetype = "95% CI",
+                          color = "Full Dataset")) + 
+  geom_line(attr_deaths_est_log_smoothed_time_lin_post_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_ub, linetype = "95% CI",
+                          color = "Full Dataset")) + 
+  geom_line(attr_deaths_est_log_smoothed_time_lin_post_subset_summary, 
+            mapping = aes(x = year, y = total_attr_deaths, linetype = "Estimate",
+                          color = "Subset Dataset")) + 
+  geom_line(attr_deaths_est_log_smoothed_time_lin_post_subset_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_lb, 
+                          linetype = "95% CI",
+                          color = "Subset Dataset")) + 
+  geom_line(attr_deaths_est_log_smoothed_time_lin_post_subset_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_ub, 
+                          linetype = "95% CI",
+                          color = "Subset Dataset")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "", color = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+## Analysis With Linear Effects Periods After Treatment Logistic Regression
+```{r}
+
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time<-gam(cbind(round(imputed_deaths), round(num_alive))~ State +
+                                                                  s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                  Naloxone_Pharmacy_Yes_Redefined + 
+                                                                  lag_num_pd_w_naloxone_yes +
+                                                                  Naloxone_Pharmacy_No_Redefined + 
+                                                                  lag_num_pd_w_naloxone_no +
+                                                                  Medical_Marijuana_Redefined + 
+                                                                  lag_num_pd_w_med_marijuana +
+                                                                  Recreational_Marijuana_Redefined + 
+                                                                  lag_num_pd_w_rec_marijuana +
+                                                                  GSL_Redefined + 
+                                                                  lag_num_pd_w_gsl +
+                                                                  PDMP_Redefined + 
+                                                                  lag_num_pd_w_pdmp +
+                                                                  Medicaid_Expansion_Redefined +
+                                                                  lag_num_pd_w_medicaid +
+                                                                  Intervention_Redefined +
+                                                                  lag_num_pd_w_tx,
+                                                                data = sensitivity_anlys_event_study_data_lin_post_tx,
+                                                                family = "binomial")
+summary(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time)
+
+plot(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time, pages = 1)
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_logistic_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_lin_post_tx_logistic_smoothed_time <- coef(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time_w_cov <- 
+  compute_sd_and_CI_logistic(as.matrix(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_logistic_smoothed_time), 
+                    (sensitivity_anlys_event_study_data$prop_dead),
+                    coefficient_values_sensitivity_anlys_lin_post_tx_logistic_smoothed_time, 
+                    k = ncol(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_logistic_smoothed_time),
+                    print_full_cov = TRUE)
+# format(round(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time, 3), nsmall = 3)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time <- sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time_w_cov[[1]]
+
+colnames(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time) <- c("conf.low", "estimate", "conf.high", "exp_lb",
+                                                                              "exp_coef", "exp_ub", "sd")
+sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term <- rownames(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$ci_95 <- 
+  paste("95% CI = (", format(round(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       Linear Intervention") + 
+  scale_color_grey() + 
+  geom_text(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.5, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_logistic_all_yr <- sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time[51:66,]
+table_of_RR_lin_eff_logistic_all_yr$estimate <- round(exp(table_of_RR_lin_eff_logistic_all_yr$estimate), 3)
+table_of_RR_lin_eff_logistic_all_yr$conf.low <- exp(table_of_RR_lin_eff_logistic_all_yr$conf.low)
+table_of_RR_lin_eff_logistic_all_yr$conf.high <- exp(table_of_RR_lin_eff_logistic_all_yr$conf.high)
+table_of_RR_lin_eff_logistic_all_yr$ci_95 <- paste("95% CI = (", 
+                                                   format(round(table_of_RR_lin_eff_logistic_all_yr$conf.low, 3), nsmall = 3), ", ", 
+                                                   format(round(table_of_RR_lin_eff_logistic_all_yr$conf.high, 3), nsmall = 3), ")", 
+                                                   sep = "")
+
+# write.csv(table_of_RR_lin_eff_logistic_all_yr, "./Data/table_of_RR_lin_eff_logistic_all_yr_5_13_22.csv")
+table_of_RR_lin_eff_logistic_all_yr
+```
+
+### Attributable Deaths
+```{r}
+date_data <- sensitivity_anlys_event_study_data_lin_post_tx[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+var_cov_mat_beta_logistic_tx <- as.matrix(sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time_w_cov[[2]][
+  c("Intervention_Redefined", "lag_num_pd_w_tx"), c("Intervention_Redefined", "lag_num_pd_w_tx")])
+
+attr_deaths_est_logistic_smoothed_time_lin_post <- attr_death_compute(sensitivity_anlys_event_study_data_lin_post_tx,
+                                                                      sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time,
+                                                                      tx_name = c("Intervention_Redefined",
+                                                                                                    "lag_num_pd_w_tx"),
+                                                                      var_cov_mat_beta_logistic_tx)
+
+attr_deaths_est_logistic_smoothed_time_lin_post <- merge(attr_deaths_est_logistic_smoothed_time_lin_post, date_data, 
+                                                         by.x = "Time_Period", by.y = "Time_Period_ID")
+
+attr_deaths_est_logistic_smoothed_time_lin_post_summary <- attr_deaths_est_logistic_smoothed_time_lin_post %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(total_attr_deaths = sum(attr_deaths),
+            total_attr_deaths_lb = sum(attr_deaths_lb),
+            total_attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_summary$total_attr_deaths)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_summary$total_attr_deaths_lb)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_summary$total_attr_deaths_ub)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_summary$total_attr_deaths)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_summary$total_attr_deaths_lb)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_summary$total_attr_deaths_ub)/sum(main_analysis_data$imputed_deaths)
+
+ggplot(attr_deaths_est_logistic_smoothed_time_lin_post_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = total_attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = total_attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = total_attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Per Year,
+       Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+
+
+#overall national overdose deaths
+national_od <- sensitivity_anlys_event_study_data_lin_post_tx %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(total_od = sum(imputed_deaths),
+            total_od_prob = sum(imputed_deaths)/sum(population),
+            total_pop = sum(population))
+
+
+
+national_od <- merge(national_od, attr_deaths_est_logistic_smoothed_time_lin_post_summary, by = "year")
+
+ggplot(national_od, aes(x = year)) + 
+  geom_line(aes(y = total_od, color = "Oberved OD")) +
+  geom_line(aes(y = total_attr_deaths, color = "Lives Saved", linetype = "Estimate")) + 
+  geom_line(aes(y = total_attr_deaths_lb, color = "Lives Saved", linetype = "95% CI")) + 
+  geom_line(aes(y = total_attr_deaths_ub, color = "Lives Saved", linetype = "95% CI")) + 
+  geom_line(aes(y = total_attr_deaths + total_od, 
+                color = "Potential Number of Deaths Had There Not Been DIH Prosecutions")) + 
+  labs(x = "Date", y = "People",
+       title = "Number of OD Deaths and Estimated Number of Lives Saved in Each Year",
+       color = "", linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+```
+
+## Analysis With Only Periods After Treatment Subset Periods
+```{r}
+#run the gam model
+data_subset <- sensitivity_anlys_event_study_data_lin_post_tx[sensitivity_anlys_event_study_data_lin_post_tx$Time_Period_ID <= 30,]
+sensitivity_anlys_post_tx_model_logistic_smoothed_time_subset<-gam(cbind(round(imputed_deaths), round(num_alive))~ State +
+                                                                     s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                     Naloxone_Pharmacy_Yes_Redefined + 
+                                                                     lag_num_pd_w_naloxone_yes +
+                                                                     Naloxone_Pharmacy_No_Redefined + 
+                                                                     lag_num_pd_w_naloxone_no +
+                                                                     Medical_Marijuana_Redefined + 
+                                                                     lag_num_pd_w_med_marijuana +
+                                                                     Recreational_Marijuana_Redefined + 
+                                                                     lag_num_pd_w_rec_marijuana +
+                                                                     GSL_Redefined + 
+                                                                     lag_num_pd_w_gsl +
+                                                                     PDMP_Redefined + 
+                                                                     lag_num_pd_w_pdmp +
+                                                                     Medicaid_Expansion_Redefined +
+                                                                     lag_num_pd_w_medicaid +
+                                                                     Intervention_Redefined +
+                                                                     lag_num_pd_w_tx,
+                                                                   data = data_subset,
+                                                                   family = "binomial")
+summary(sensitivity_anlys_post_tx_model_logistic_smoothed_time_subset)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_logistic_smoothed_time_subset <-
+  data.frame(predict(sensitivity_anlys_post_tx_model_logistic_smoothed_time_subset, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_logistic_smoothed_time_subset <- coef(sensitivity_anlys_post_tx_model_logistic_smoothed_time_subset)
+
+sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset_w_cov <- 
+  compute_sd_and_CI_logistic(as.matrix(full_df_w_basis_functions_sensitivity_anlys_post_tx_logistic_smoothed_time_subset), 
+                    (data_subset$prop_dead),
+                    coefficient_values_sensitivity_anlys_post_tx_logistic_smoothed_time_subset,
+                    k = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_logistic_smoothed_time_subset),
+                    print_full_cov = TRUE)
+# sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset
+
+sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset <- 
+  sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset_w_cov[[1]]
+
+colnames(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset) <- c("conf.low", "estimate", "conf.high",
+                                                                                 "exp_lb", "exp_coef", "exp_ub", "sd")
+sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term <- rownames(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset)
+
+sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$ci_95 <- 
+  paste("95% CI = (", format(round(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       Linear Intervention, Subset Data") + 
+  scale_color_grey()  + 
+  geom_text(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.5, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_logistic_all_yr_subset <- sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset[51:66,]
+table_of_RR_lin_eff_logistic_all_yr_subset$estimate <- round(exp(table_of_RR_lin_eff_logistic_all_yr_subset$estimate), 3)
+table_of_RR_lin_eff_logistic_all_yr_subset$conf.low <- exp(table_of_RR_lin_eff_logistic_all_yr_subset$conf.low)
+table_of_RR_lin_eff_logistic_all_yr_subset$conf.high <- exp(table_of_RR_lin_eff_logistic_all_yr_subset$conf.high)
+table_of_RR_lin_eff_logistic_all_yr_subset$ci_95 <- paste("95% CI = (", 
+                                                          format(round(table_of_RR_lin_eff_logistic_all_yr_subset$conf.low, 3), 
+                                                                 nsmall = 3), ", ", 
+                                                          format(round(table_of_RR_lin_eff_logistic_all_yr_subset$conf.high, 3), 
+                                                                 nsmall = 3), ")", sep = "")
+
+# write.csv(table_of_RR_lin_eff_logistic_all_yr_subset, "./Data/table_of_RR_lin_eff_logistic_all_yr_subset_5_13_22.csv")
+table_of_RR_lin_eff_logistic_all_yr_subset
+```
+
+### Attributable Deaths
+```{r}
+date_data_subset <- data_subset[, c("Time_Period_ID", "Time_Period_Start")]
+date_data_subset <- date_data_subset[!duplicated(date_data_subset),]
+var_cov_mat_beta_logistic_tx_subset <- as.matrix(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset_w_cov[[2]][
+  c("Intervention_Redefined", "lag_num_pd_w_tx"), c("Intervention_Redefined", "lag_num_pd_w_tx")])
+attr_deaths_est_logistic_smoothed_time_lin_post_subset <- attr_death_compute(
+  data_subset,
+  sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset, 
+  tx_name = c("Intervention_Redefined", "lag_num_pd_w_tx"),
+  var_cov_mat_beta_logistic_tx_subset)
+attr_deaths_est_logistic_smoothed_time_lin_post_subset <- merge(attr_deaths_est_logistic_smoothed_time_lin_post_subset, date_data_subset, 
+                                                                by.x = "Time_Period", by.y = "Time_Period_ID")
+
+
+attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary <- attr_deaths_est_logistic_smoothed_time_lin_post_subset %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(total_attr_deaths = sum(attr_deaths),
+            total_attr_deaths_lb = sum(attr_deaths_lb),
+            total_attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary$total_attr_deaths)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary$total_attr_deaths_lb)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary$total_attr_deaths_ub)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary$total_attr_deaths)/sum(data_subset$imputed_deaths)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary$total_attr_deaths_lb)/sum(data_subset$imputed_deaths)
+sum(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary$total_attr_deaths_ub)/sum(data_subset$imputed_deaths)
+
+
+ggplot(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = total_attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = total_attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = total_attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Per Year 
+       Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+
+
+ggplot() + 
+  geom_line(attr_deaths_est_logistic_smoothed_time_lin_post_summary, 
+            mapping = aes(x = year, y = total_attr_deaths, linetype = "Estimate",
+                          color = "Full Dataset")) + 
+  geom_line(attr_deaths_est_logistic_smoothed_time_lin_post_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_lb, linetype = "95% CI",
+                          color = "Full Dataset")) + 
+  geom_line(attr_deaths_est_logistic_smoothed_time_lin_post_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_ub, linetype = "95% CI",
+                          color = "Full Dataset")) + 
+  geom_line(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary, 
+            mapping = aes(x = year, y = total_attr_deaths, linetype = "Estimate",
+                          color = "Subset Dataset")) + 
+  geom_line(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_lb, 
+                          linetype = "95% CI",
+                          color = "Subset Dataset")) + 
+  geom_line(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary, 
+            mapping = aes(x = year, y = total_attr_deaths_ub, 
+                          linetype = "95% CI",
+                          color = "Subset Dataset")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "", color = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+
+
+# OLS Model Two Year With Linear Fixed Time Effects Interacted with Region With Log Proportion 
+## Create Two Year Data
+```{r}
+#create a plot for each state to see how many prosecution media alerts there are per 6 month period
+#read in the prosecution media alert data
+prosecution_data<-read.csv("./Data/dih_prosecutions_9_6_21.csv")
+
+#data cleaning
+prosecution_data<-prosecution_data %>% 
+  mutate(Date = as.Date(Date.charged, "%m/%d/%Y")) %>%
+  mutate(State = ifelse(State.Filed == "pennsylvania", "Pennsylvania", State.Filed),
+         State = ifelse(State.Filed == "Virginia ", "Virginia", State)) %>%
+  filter(!is.na(Date), State.Filed != "No Info", State.Filed != "No info", State.Filed != "No Info ",
+         State != "")
+
+#clean up the data by looking at the link to the article
+prosecution_data$Date[prosecution_data$Date == "2026-08-01"] <- as.Date("2016-02-15", "%Y-%m-%d")
+
+#change the states into Character instead of factor
+prosecution_data$State<-as.character(prosecution_data$State)
+#see how many prosecution data points there are for each state
+table(prosecution_data$State)
+
+#there are some repeated cases depending on victim
+prosecution_data_unique <- prosecution_data %>%
+  group_by(State) %>%
+  distinct(Accused.Name, Date, .keep_all = T)
+table(prosecution_data_unique$State)
+
+#change date charged into Date object
+prosecution_data_unique$Date<-mdy(prosecution_data_unique$Date.charged)
+
+#group the data into six month periods
+prosecution_data_unique<-prosecution_data_unique %>% 
+  mutate(six_month_pd = lubridate::floor_date(Date , "6 months" ))
+
+#count the number of prosecution media alerts in each six month period
+#we also get the first and last date of prosecution in time period
+prosecution_data_by_six_month_pd <- prosecution_data_unique %>%
+  filter(year(six_month_pd)>1999 & year(six_month_pd)<2020) %>%
+  group_by(State, six_month_pd) %>%
+  summarise(first_date_in_pd = min(Date), last_date_in_pd = max(Date))
+
+#create the data set used for this sensitivity analysis
+#first, we merge the grouped prosecution data set with the main data set by state and time period
+sensitivity_anlys_redefine_int_data<-merge(main_analysis_data,
+                                           prosecution_data_by_six_month_pd,
+                                           by.x = c("State", "Time_Period_Start"),
+                                           by.y = c("State", "six_month_pd"), all = TRUE)
+
+#create a intervention 2 year effect variable by initializing it to be all 0
+sensitivity_anlys_redefine_int_data<-sensitivity_anlys_redefine_int_data %>%
+  group_by(State) %>%
+  mutate(int_2_yr_effect = 0)
+
+#change the date into a date object
+sensitivity_anlys_redefine_int_data$Time_Period_Start<-as.Date(sensitivity_anlys_redefine_int_data$Time_Period_Start)
+sensitivity_anlys_redefine_int_data$Time_Period_End<-as.Date(sensitivity_anlys_redefine_int_data$Time_Period_End)
+
+#we need to impute the newly defined intervention variable depending on the case
+#by examining each row of the data set
+for(state in unique(sensitivity_anlys_redefine_int_data$State)){
+  #first, subset the data set into state_data which only contains the data for the state
+  state_index<-which(sensitivity_anlys_redefine_int_data$State == state)
+  state_data<-sensitivity_anlys_redefine_int_data[state_index,]
+  
+  #note that the first four rows of the 2 year effect intervention variable are the same as the
+  #first four rows of the original intervention variable
+  state_data$int_2_yr_effect[1:4]<-state_data$Intervention_Redefined[1:4]
+  
+  for(i in 5:nrow(state_data)){
+    #next, we deal with the rows where there was at least one prosecution in the last 3 six month periods
+    #These rows will be imputed with a 1
+    if((!is.na(state_data$first_date_in_pd[i - 1]) |
+        !is.na(state_data$first_date_in_pd[i - 2]) |
+        !is.na(state_data$first_date_in_pd[i - 3]))){
+      
+      state_data$int_2_yr_effect[i]<-1
+      
+    }else{
+      #next, we account for the rows with the fractions:
+      # 1) an intervention occurs in row i without an intervention 2 years ago
+      # 2) row i contains the lasting effects of an intervention that occurred 2 years ago
+      # 3) row i contains effects from both a new intervention starting in row i and lasting
+      # effects from 2 years ago
+      
+      #To compute the fraction, we add the number of days that are affected by an intervention
+      #(from both the current prosecution and previous prosecution) and then divide by the total
+      #number of days in the period:
+      
+      total_len_of_pd<-as.numeric(state_data$Time_Period_End[i] - state_data$Time_Period_Start[i])
+      
+      #If there is no prosecution two years ago, i.e. in period i-4, then the last_date is the first
+      #date in period i. We subtract the last_date by the first date in the period, so we will get
+      #a 0 for the number of days that are affected by a prosecution from period i-4. Otherwise,
+      #the last_date is the last date of prosecution from period i-4, plus 2 years.
+      len_of_past_effect <- ifelse(!is.na(state_data$first_date_in_pd[i - 4]),
+                                   (state_data$last_date_in_pd[i - 4] + years(2)) - state_data$Time_Period_Start[i],
+                                   0)
+      
+      #If there is no prosecution in the period i, then the start_date is the last date in the period i.
+      #We subtract start_date from the last date in period i, so we will get a 0 for the number
+      #of days that are affected by a prosecution in period i. Otherwise, the start_date is the
+      #first date of a prosecution in period i.
+      len_of_current_effect <- ifelse(!is.na(state_data$first_date_in_pd[i]),
+                                      as.numeric(state_data$Time_Period_End[i] - state_data$first_date_in_pd[i]),
+                                      0)
+      
+      state_data$int_2_yr_effect[i]<-(len_of_past_effect + len_of_current_effect)/total_len_of_pd
+    }
+  }
+  
+  #for the case where the int_2_yr_effect is greater than 1 (could result when we add the effects of
+  #previous intervention and the current intervention), we just impute a 1 instead
+  state_data$int_2_yr_effect[state_data$int_2_yr_effect>1]<-1
+  
+  #lastly, we store the int_2_yr_effect variable into the sensitivity analysis data set
+  sensitivity_anlys_redefine_int_data$int_2_yr_effect[state_index]<-state_data$int_2_yr_effect
+}
+
+#view the data set just to make sure the imputation looks right
+# View(sensitivity_anlys_redefine_int_data %>% select(State, Time_Period_Start, Time_Period_End,
+#                                                     Intervention_Redefined, first_date_in_pd,
+#                                                     last_date_in_pd,
+#                                                     int_2_yr_effect))
+
+
+sensitivity_anlys_redefine_int_data <- sensitivity_anlys_redefine_int_data %>%
+  group_by(Time_Period_Start) %>%
+  mutate(num_states_w_intervention_2_yr_effect = sum(int_2_yr_effect))
+
+
+```
+
+## OLS no GAM
+```{r}
+#compute the proportion of people who died from drug overdose
+sensitivity_anlys_redefine_int_data$prop_dead <- sensitivity_anlys_redefine_int_data$imputed_deaths/
+  sensitivity_anlys_redefine_int_data$population
+
+
+#fit an OLS with smoothed time effects
+sensitivity_analysis_model_log_two_yr_not_gam<-lm(log(prop_dead)~ State +
+                                                     # s(Time_Period_ID, bs = "cr", by = as.factor(Region)) +
+                                                    Time_Period_ID:as.factor(Region) + 
+                                                     Naloxone_Pharmacy_Yes_Redefined +
+                                                     Naloxone_Pharmacy_No_Redefined +
+                                                     Medical_Marijuana_Redefined +
+                                                     Recreational_Marijuana_Redefined +
+                                                     GSL_Redefined +
+                                                     PDMP_Redefined +
+                                                     Medicaid_Expansion_Redefined +
+                                                     int_2_yr_effect+
+                                                     num_states_w_intervention,
+                                                   data = sensitivity_anlys_redefine_int_data)
+
+summary(sensitivity_analysis_model_log_two_yr_not_gam)
+
+#examine fitted values
+
+par(mfrow = c(2,2))
+plot(sensitivity_analysis_model_log_two_yr_not_gam)
+par(mfrow = c(1,1))
+```
+
+### Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_two_yr_not_gam <- model.matrix(sensitivity_analysis_model_log_two_yr_not_gam)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_two_yr_not_gam <- coef(sensitivity_analysis_model_log_two_yr_not_gam)
+#type = "response" to get the estimated probabilities
+sens_analysis_sd_and_ci_log_two_yr_not_gam <- compute_sd_and_CI_linear_link(full_df_w_basis_functions_log_two_yr_not_gam,
+                                                                log(sensitivity_anlys_redefine_int_data$prop_dead),
+                                                                coefficient_values_log_fixed_two_yr_not_gam,
+                                                                k = ncol(full_df_w_basis_functions_log_two_yr_not_gam))
+
+colnames(sens_analysis_sd_and_ci_log_two_yr_not_gam) <- c("conf.low", "estimate", "conf.high", "sd")
+sens_analysis_sd_and_ci_log_two_yr_not_gam$term <- rownames(sens_analysis_sd_and_ci_log_two_yr_not_gam)
+
+
+sens_analysis_sd_and_ci_log_two_yr_not_gam$ci_95 <- 
+  paste("95% CI = (", format(round(sens_analysis_sd_and_ci_log_two_yr_not_gam$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sens_analysis_sd_and_ci_log_two_yr_not_gam$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sens_analysis_sd_and_ci_log_two_yr_not_gam[51:59,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Effects, 
+       2 Year Exposure Intervention") + 
+  scale_color_grey()     + 
+  geom_text(sens_analysis_sd_and_ci_log_two_yr_not_gam[51:59,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 9:1), size = 3) + 
+  geom_text(sens_analysis_sd_and_ci_log_two_yr_not_gam[51:59,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 9:1), size = 3) +
+  xlim(-.3, 1.1)
+```
+
+```{r}
+two_yr_analysis_coef_of_interest_RR_not_gam <- sens_analysis_sd_and_ci_log_two_yr_not_gam[51:59,]
+two_yr_analysis_coef_of_interest_RR_not_gam$est_RR <- round(exp(two_yr_analysis_coef_of_interest_RR_not_gam$estimate), 4)
+two_yr_analysis_coef_of_interest_RR_not_gam$est_RR_lb <- round(exp(two_yr_analysis_coef_of_interest_RR_not_gam$conf.low), 4)
+two_yr_analysis_coef_of_interest_RR_not_gam$est_RR_ub <- round(exp(two_yr_analysis_coef_of_interest_RR_not_gam$conf.high), 4)
+
+two_yr_analysis_coef_of_interest_RR_not_gam[,c("est_RR", "est_RR_lb", "est_RR_ub")]
+
+```
+
+
+
+## Constant Effect Model
+```{r}
+#compute the proportion of people who died from drug overdose
+sensitivity_anlys_redefine_int_data$prop_dead <- sensitivity_anlys_redefine_int_data$imputed_deaths/
+  sensitivity_anlys_redefine_int_data$population
+
+
+#fit an OLS with smoothed time effects
+sensitivity_analysis_model_log_fixed_lin_time<-gam(log(prop_dead)~ State +
+                                                     s(Time_Period_ID, bs = "cr", by = as.factor(Region)) + 
+                                                     Naloxone_Pharmacy_Yes_Redefined +
+                                                     Naloxone_Pharmacy_No_Redefined +
+                                                     Medical_Marijuana_Redefined +
+                                                     Recreational_Marijuana_Redefined +
+                                                     GSL_Redefined +
+                                                     PDMP_Redefined +
+                                                     Medicaid_Expansion_Redefined +
+                                                     int_2_yr_effect+
+                                                     num_states_w_intervention,
+                                                   data = sensitivity_anlys_redefine_int_data)
+
+summary(sensitivity_analysis_model_log_fixed_lin_time)
+
+#examine fitted values
+summary(fitted(sensitivity_analysis_model_log_fixed_lin_time))
+hist(fitted(sensitivity_analysis_model_log_fixed_lin_time))
+par(mfrow = c(2,2))
+plot(sensitivity_analysis_model_log_fixed_lin_time)
+```
+
+### Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_fixed_lin_time_2_yr <- model.matrix(sensitivity_analysis_model_log_fixed_lin_time)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_lin_time_sens_anlys <- coef(sensitivity_analysis_model_log_fixed_lin_time)
+#type = "response" to get the estimated probabilities
+sens_analysis_sd_and_ci_log_fixed_lin_time <- compute_sd_and_CI_linear_link(full_df_w_basis_functions_log_fixed_lin_time_2_yr,
+                                                                log(sensitivity_anlys_redefine_int_data$prop_dead),
+                                                                coefficient_values_log_fixed_lin_time_sens_anlys,
+                                                                k = ncol(full_df_w_basis_functions_log_fixed_lin_time_2_yr))
+
+colnames(sens_analysis_sd_and_ci_log_fixed_lin_time) <- c("conf.low", "estimate", "conf.high", "sd")
+sens_analysis_sd_and_ci_log_fixed_lin_time$term <- rownames(sens_analysis_sd_and_ci_log_fixed_lin_time)
+
+
+sens_analysis_sd_and_ci_log_fixed_lin_time$ci_95 <- 
+  paste("95% CI = (", format(round(sens_analysis_sd_and_ci_log_fixed_lin_time$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sens_analysis_sd_and_ci_log_fixed_lin_time$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sens_analysis_sd_and_ci_log_fixed_lin_time[51:59,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Effects, 
+       2 Year Exposure Intervention") + 
+  scale_color_grey()     + 
+  geom_text(sens_analysis_sd_and_ci_log_fixed_lin_time[51:59,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 9:1), size = 3) + 
+  geom_text(sens_analysis_sd_and_ci_log_fixed_lin_time[51:59,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 9:1), size = 3) +
+  xlim(-.3, 1.1)
+```
+
+```{r}
+two_yr_analysis_coef_of_interest_RR <- sens_analysis_sd_and_ci_log_fixed_lin_time[51:59,]
+two_yr_analysis_coef_of_interest_RR$est_RR <- round(exp(two_yr_analysis_coef_of_interest_RR$estimate), 3)
+two_yr_analysis_coef_of_interest_RR$est_RR_lb <- round(exp(two_yr_analysis_coef_of_interest_RR$conf.low), 3)
+two_yr_analysis_coef_of_interest_RR$est_RR_ub <- round(exp(two_yr_analysis_coef_of_interest_RR$conf.high), 3)
+
+two_yr_analysis_coef_of_interest_RR[,c("est_RR", "est_RR_lb", "est_RR_ub")]
+
+```
+
+## Create Linear Trend Data
+
+```{r}
+#use this function to compute the cumulative sum, but resets the sum if the variable was 0
+compute_cumsum = function(x){
+  cs = cumsum(x)
+  cs - cummax((x == 0) * cs)
+}
+sensitivity_anlys_event_study_data_lin_post_tx_2yr <- sensitivity_anlys_redefine_int_data %>%
+  arrange(State, Time_Period_ID) %>%
+  group_by(State) %>%
+  mutate(num_pd_w_tx = compute_cumsum(int_2_yr_effect),
+         num_pd_w_naloxone_yes = compute_cumsum(Naloxone_Pharmacy_Yes_Redefined),
+         num_pd_w_naloxone_no = compute_cumsum(Naloxone_Pharmacy_No_Redefined),
+         num_pd_w_med_marijuana = compute_cumsum(Medical_Marijuana_Redefined),
+         num_pd_w_rec_marijuana = compute_cumsum(Recreational_Marijuana_Redefined),
+         num_pd_w_gsl = compute_cumsum(GSL_Redefined),
+         num_pd_w_pdmp = compute_cumsum(PDMP_Redefined),
+         num_pd_w_medicaid = compute_cumsum(Medicaid_Expansion_Redefined),
+         lag_num_pd_w_tx = lag(num_pd_w_tx),
+         lag_num_pd_w_naloxone_yes = lag(num_pd_w_naloxone_yes),
+         lag_num_pd_w_naloxone_no = lag(num_pd_w_naloxone_no),
+         lag_num_pd_w_med_marijuana = lag(num_pd_w_med_marijuana),
+         lag_num_pd_w_rec_marijuana = lag(num_pd_w_rec_marijuana),
+         lag_num_pd_w_gsl = lag(num_pd_w_gsl),
+         lag_num_pd_w_pdmp = lag(num_pd_w_pdmp),
+         lag_num_pd_w_medicaid = lag(num_pd_w_medicaid)) #lag so that intercept = effect when tx first occurs
+
+#fill in a 0 for the NAs so we keep all the data and at most this will be 0
+sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_tx[
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$Intervention_Redefined < 1] <- 
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_naloxone_yes[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$Naloxone_Pharmacy_Yes_Redefined < 1]<-
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_naloxone_no[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$Naloxone_Pharmacy_No_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_med_marijuana[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$Medical_Marijuana_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_rec_marijuana[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$Recreational_Marijuana_Redefined < 1] <- 
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_gsl[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$GSL_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_pdmp[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$PDMP_Redefined < 1] <-
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_medicaid[
+    sensitivity_anlys_event_study_data_lin_post_tx_2yr$Medicaid_Expansion_Redefined < 1] <-0
+
+#for the linear effects, we want the 2 year effect variable to be 0 when treatment is 0
+sensitivity_anlys_event_study_data_lin_post_tx_2yr$lag_num_pd_w_tx[
+  sensitivity_anlys_event_study_data_lin_post_tx_2yr$int_2_yr_effect == 0] <- 0
+```
+
+## Model 
+```{r}
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_log_smoothed_time_2yr<-gam(log(prop_dead)~ State +
+                                                                 s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                 Naloxone_Pharmacy_Yes_Redefined + 
+                                                                 lag_num_pd_w_naloxone_yes +
+                                                                 Naloxone_Pharmacy_No_Redefined + 
+                                                                 lag_num_pd_w_naloxone_no +
+                                                                 Medical_Marijuana_Redefined + 
+                                                                 lag_num_pd_w_med_marijuana +
+                                                                 Recreational_Marijuana_Redefined + 
+                                                                 lag_num_pd_w_rec_marijuana +
+                                                                 GSL_Redefined + 
+                                                                 lag_num_pd_w_gsl +
+                                                                 PDMP_Redefined + 
+                                                                 lag_num_pd_w_pdmp +
+                                                                 Medicaid_Expansion_Redefined +
+                                                                 lag_num_pd_w_medicaid +
+                                                                 int_2_yr_effect +
+                                                                 lag_num_pd_w_tx,
+                                                               data = sensitivity_anlys_event_study_data_lin_post_tx_2yr)
+summary(sensitivity_anlys_lin_post_tx_model_log_smoothed_time_2yr)
+
+plot(sensitivity_anlys_lin_post_tx_model_log_smoothed_time_2yr, pages = 1)
+
+```
+
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx_2_yr <- model.matrix(sensitivity_anlys_lin_post_tx_model_log_smoothed_time_2yr)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_lin_time_lin_post_tx_2yr <- coef(sensitivity_anlys_lin_post_tx_model_log_smoothed_time_2yr)
+#type = "response" to get the estimated probabilities
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_w_cov <-
+  compute_sd_and_CI_linear_link(full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx_2_yr,
+                    log(sensitivity_anlys_event_study_data_lin_post_tx_2yr$prop_dead),
+                    coefficient_values_log_fixed_lin_time_lin_post_tx_2yr,
+                    k = ncol(full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx_2_yr),
+                    print_full_cov = TRUE)
+# format(round(main_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx,4)
+
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx <- sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_w_cov[[1]]
+
+colnames(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx) <- c("conf.low", "estimate", "conf.high", "sd")
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term <- rownames(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx)
+
+
+
+
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$ci_95 <- 
+  paste("95% CI = (", format(round(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       2 Year Linear Intervention") + 
+  scale_color_grey()      + 
+  geom_text(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.3, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_log_2_yr <- sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx[51:66,]
+table_of_RR_lin_eff_log_2_yr$estimate <- round(exp(table_of_RR_lin_eff_log_2_yr$estimate), 4)
+table_of_RR_lin_eff_log_2_yr$conf.low <- exp(table_of_RR_lin_eff_log_2_yr$conf.low)
+table_of_RR_lin_eff_log_2_yr$conf.high <- exp(table_of_RR_lin_eff_log_2_yr$conf.high)
+table_of_RR_lin_eff_log_2_yr$ci_95 <- paste("95% CI = (", 
+                                            format(round(table_of_RR_lin_eff_log_2_yr$conf.low, 4), nsmall = 4), ", ", 
+                                            format(round(table_of_RR_lin_eff_log_2_yr$conf.high, 4), nsmall = 4), ")", sep = "")
+
+# write.csv(table_of_RR_lin_eff_log_2_yr, "./Data/table_of_RR_lin_eff_log_2_yr_5_13_22.csv")
+table_of_RR_lin_eff_log_2_yr
+```
+
+### Plot Effects
+```{r}
+plot_data <- data.frame(time_after_tx = 0:38,
+                        coef = sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                            sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:38),
+                        conf.low = sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low[
+                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low[
+                            sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:38),
+                        conf.high = sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high[
+                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high[
+                            sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:38))
+
+ggplot(plot_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = coef, linetype = "Estimated Effect")) + 
+  geom_line(aes(y = conf.low, linetype = "95% CI")) + 
+  geom_line(aes(y = conf.high, linetype = "95% CI")) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Effect",
+       title = "Estimated Effect of DIH Prosecutions Reported in the Media on 
+       Drug OD Deaths by Number of Periods After Exposure, 
+       Assuming Two Year Effect") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 0), color = "grey", linetype = "dotted")
+```
+
+### Attributable Deaths
+```{r}
+date_data_2yr <- sensitivity_anlys_event_study_data_lin_post_tx_2yr[, c("Time_Period_ID", "Time_Period_Start")]
+date_data_2yr <- date_data_2yr[!duplicated(date_data_2yr),]
+var_cov_mat_beta_lin_tx_two_yr <- as.matrix(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_w_cov[[2]][
+  c("int_2_yr_effect", "lag_num_pd_w_tx"), c("int_2_yr_effect", "lag_num_pd_w_tx")])
+attr_deaths_est_log_lin_time_lin_post_tx_2yr <- attr_death_compute(sensitivity_anlys_event_study_data_lin_post_tx_2yr,
+                                                                   sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx, 
+                                                                   tx_name = c("int_2_yr_effect", "lag_num_pd_w_tx"),
+                                                                   var_cov_mat_beta_lin_tx_two_yr)
+attr_deaths_est_log_lin_time_lin_post_tx_2yr <- merge(attr_deaths_est_log_lin_time_lin_post_tx_2yr, date_data_2yr, 
+                                                      by.x = "Time_Period", by.y = "Time_Period_ID")
+
+
+attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary <- attr_deaths_est_log_lin_time_lin_post_tx_2yr %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(attr_deaths = sum(attr_deaths),
+            attr_deaths_lb = sum(attr_deaths_lb),
+            attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_lb)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_ub)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths)/
+  sum(sensitivity_anlys_event_study_data_lin_post_tx_2yr$imputed_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_lb)/
+  sum(sensitivity_anlys_event_study_data_lin_post_tx_2yr$imputed_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_ub)/
+  sum(sensitivity_anlys_event_study_data_lin_post_tx_2yr$imputed_deaths)
+
+
+ggplot(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+## Linear Policy Measures Post Tx Subset
+```{r}
+sens_data_subset <- sensitivity_anlys_event_study_data_lin_post_tx_2yr %>%
+  filter(Time_Period_ID <= 30)
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr<-gam(log(prop_dead)~ State +
+                                                                  s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                  Naloxone_Pharmacy_Yes_Redefined + 
+                                                                  lag_num_pd_w_naloxone_yes +
+                                                                  Naloxone_Pharmacy_No_Redefined + 
+                                                                  lag_num_pd_w_naloxone_no +
+                                                                  Medical_Marijuana_Redefined + 
+                                                                  lag_num_pd_w_med_marijuana +
+                                                                  Recreational_Marijuana_Redefined + 
+                                                                  lag_num_pd_w_rec_marijuana +
+                                                                  GSL_Redefined + 
+                                                                  lag_num_pd_w_gsl +
+                                                                  PDMP_Redefined + 
+                                                                  lag_num_pd_w_pdmp +
+                                                                  Medicaid_Expansion_Redefined +
+                                                                  lag_num_pd_w_medicaid +
+                                                                  int_2_yr_effect +
+                                                                  lag_num_pd_w_tx,
+                                                                data = sens_data_subset)
+summary(sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr)
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx_subset_2yr <-
+  model.matrix(sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_lin_time_lin_post_tx_subset_2yr <- coef(sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr)
+#type = "response" to get the estimated probabilities
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset_w_cov <-
+  compute_sd_and_CI_linear_link(full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx_subset_2yr,
+                    log(sens_data_subset$prop_dead),
+                    coefficient_values_log_fixed_lin_time_lin_post_tx_subset_2yr,
+                    k = ncol(full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx_subset_2yr),
+                    print_full_cov = TRUE)
+# format(round(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset,4)
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset <- 
+  sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset_w_cov[[1]]
+
+colnames(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset) <- c("conf.low", "estimate", "conf.high", "sd")
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term <-
+  rownames(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset)
+
+
+sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$ci_95 <- 
+  paste("95% CI = (", format(round(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       2 Year Linear Intervention, Subset Data") + 
+  scale_color_grey()  + 
+  geom_text(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.5, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_log_2_yr_subset <- sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset[51:66,]
+table_of_RR_lin_eff_log_2_yr_subset$estimate <- round(exp(table_of_RR_lin_eff_log_2_yr_subset$estimate), 3)
+table_of_RR_lin_eff_log_2_yr_subset$conf.low <- exp(table_of_RR_lin_eff_log_2_yr_subset$conf.low)
+table_of_RR_lin_eff_log_2_yr_subset$conf.high <- exp(table_of_RR_lin_eff_log_2_yr_subset$conf.high)
+table_of_RR_lin_eff_log_2_yr_subset$ci_95 <- paste("95% CI = (", 
+                                                   format(round(table_of_RR_lin_eff_log_2_yr_subset$conf.low, 3), nsmall = 3), ", ", 
+                                                   format(round(table_of_RR_lin_eff_log_2_yr_subset$conf.high, 3), nsmall = 3), ")", sep = "")
+
+# write.csv(table_of_RR_lin_eff_log_2_yr_subset, "./Data/table_of_RR_lin_eff_log_2_yr_subset_5_13_22.csv")
+table_of_RR_lin_eff_log_2_yr_subset
+```
+
+### Plot Effects
+```{r}
+plot_data_subset_data <- data.frame(time_after_tx = 0:28,
+                                    coef = sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$estimate[
+                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$estimate[
+                                        sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28),
+                                    conf.low = sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                        sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28),
+                                    conf.high = sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                        sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28))
+
+ggplot(plot_data_subset_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = coef, linetype = "Estimated Effect")) + 
+  geom_line(aes(y = conf.low, linetype = "95% CI")) + 
+  geom_line(aes(y = conf.high, linetype = "95% CI")) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Effect",
+       title = "Estimated Effect of DIH Prosecutions Reported in the Media on 
+       Drug OD Deaths by Number of Periods After Exposure, 
+       Assuming Two Year Effect, Without Last 5 Years") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 0), color = "grey", linetype = "dotted")
+```
+
+
+
+### Attributable Deaths
+```{r}
+date_data_subset_2yr <- sens_data_subset[, c("Time_Period_ID", "Time_Period_Start")]
+date_data_subset_2yr <- date_data_subset_2yr[!duplicated(date_data_subset_2yr),]
+var_cov_mat_beta_lin_tx_two_yr_subset <- as.matrix(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset_w_cov[[2]][
+  c("int_2_yr_effect", "lag_num_pd_w_tx"), c("int_2_yr_effect", "lag_num_pd_w_tx")])
+attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr <- attr_death_compute(sens_data_subset,
+                                                                          sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset, 
+                                                                          tx_name = c("int_2_yr_effect", "lag_num_pd_w_tx"),
+                                                                          var_cov_mat_beta_lin_tx_two_yr_subset)
+attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr <- merge(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr, date_data_subset_2yr, 
+                                                             by.x = "Time_Period", by.y = "Time_Period_ID")
+
+attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary <- attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(attr_deaths = sum(attr_deaths),
+            attr_deaths_lb = sum(attr_deaths_lb),
+            attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_lb)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_ub)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths)/
+  sum(sens_data_subset$imputed_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_lb)/
+  sum(sens_data_subset$imputed_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_ub)/
+  sum(sens_data_subset$imputed_deaths)
+
+ggplot(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+## Logistic Model
+```{r}
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time_2yr<-gam(cbind(round(imputed_deaths), round(num_alive))~ State +
+                                                                      s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                      Naloxone_Pharmacy_Yes_Redefined + 
+                                                                      lag_num_pd_w_naloxone_yes +
+                                                                      Naloxone_Pharmacy_No_Redefined + 
+                                                                      lag_num_pd_w_naloxone_no +
+                                                                      Medical_Marijuana_Redefined + 
+                                                                      lag_num_pd_w_med_marijuana +
+                                                                      Recreational_Marijuana_Redefined + 
+                                                                      lag_num_pd_w_rec_marijuana +
+                                                                      GSL_Redefined + 
+                                                                      lag_num_pd_w_gsl +
+                                                                      PDMP_Redefined + 
+                                                                      lag_num_pd_w_pdmp +
+                                                                      Medicaid_Expansion_Redefined +
+                                                                      lag_num_pd_w_medicaid +
+                                                                      int_2_yr_effect +
+                                                                      lag_num_pd_w_tx,
+                                                                    data = sensitivity_anlys_event_study_data_lin_post_tx_2yr,
+                                                                    family = "binomial")
+summary(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time_2yr)
+
+plot(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time_2yr, pages = 1)
+
+```
+
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_logistic_fixed_lin_time_lin_post_tx_2_yr <- model.matrix(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time_2yr)
+
+#estimate the 95% CI and SD
+coefficient_values_logistic_fixed_lin_time_lin_post_tx_2yr <- coef(sensitivity_anlys_lin_post_tx_model_logistic_smoothed_time_2yr)
+#type = "response" to get the estimated probabilities
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_w_cov <-
+  compute_sd_and_CI_logistic(full_df_w_basis_functions_logistic_fixed_lin_time_lin_post_tx_2_yr,
+                    (sensitivity_anlys_event_study_data_lin_post_tx_2yr$prop_dead),
+                    coefficient_values_logistic_fixed_lin_time_lin_post_tx_2yr,
+                    k = ncol(full_df_w_basis_functions_logistic_fixed_lin_time_lin_post_tx_2_yr),
+                    print_full_cov = TRUE)
+# format(round(main_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx,4)
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx <- sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_w_cov[[1]]
+
+colnames(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx) <- c("conf.low", "estimate", "conf.high", "exp_lb",
+                                                                           "exp_coef", "exp_ub", "sd")
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term <- rownames(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx)
+
+
+
+
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$ci_95 <- 
+  paste("95% CI = (", format(round(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       2 Year Linear Intervention") + 
+  scale_color_grey()      + 
+  geom_text(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.3, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_logistic_2_yr<- sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx[51:66,]
+table_of_RR_lin_eff_logistic_2_yr$estimate <- round(exp(table_of_RR_lin_eff_logistic_2_yr$estimate), 3)
+table_of_RR_lin_eff_logistic_2_yr$conf.low <- exp(table_of_RR_lin_eff_logistic_2_yr$conf.low)
+table_of_RR_lin_eff_logistic_2_yr$conf.high <- exp(table_of_RR_lin_eff_logistic_2_yr$conf.high)
+table_of_RR_lin_eff_logistic_2_yr$ci_95 <- paste("95% CI = (", 
+                                                 format(round(table_of_RR_lin_eff_logistic_2_yr$conf.low, 3), nsmall = 3), ", ", 
+                                                 format(round(table_of_RR_lin_eff_logistic_2_yr$conf.high, 3), nsmall = 3), ")", sep = "")
+
+# write.csv(table_of_RR_lin_eff_logistic_2_yr, "./Data/table_of_RR_lin_eff_logistic_2_yr_5_13_22.csv")
+table_of_RR_lin_eff_logistic_2_yr
+```
+
+### Plot Effects
+```{r}
+plot_data <- data.frame(time_after_tx = 0:38,
+                        coef = sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$estimate[
+                          sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                          sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$estimate[
+                            sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:38),
+                        conf.low = sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low[
+                          sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                          sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low[
+                            sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:38),
+                        conf.high = sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high[
+                          sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                          sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high[
+                            sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:38))
+
+ggplot(plot_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = coef, linetype = "Estimated Effect")) + 
+  geom_line(aes(y = conf.low, linetype = "95% CI")) + 
+  geom_line(aes(y = conf.high, linetype = "95% CI")) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Effect",
+       title = "Estimated Effect of DIH Prosecutions Reported in the Media on 
+       Drug OD Deaths by Number of Periods After Exposure, 
+       Assuming Two Year Effect") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 0), color = "grey", linetype = "dotted")
+```
+
+### Attributable Deaths
+```{r}
+date_data_2yr <- sensitivity_anlys_event_study_data_lin_post_tx_2yr[, c("Time_Period_ID", "Time_Period_Start")]
+date_data_2yr <- date_data_2yr[!duplicated(date_data_2yr),]
+var_cov_mat_beta_logistic_tx_two_yr <- as.matrix(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_w_cov[[2]][
+  c("int_2_yr_effect", "lag_num_pd_w_tx"), c("int_2_yr_effect", "lag_num_pd_w_tx")])
+attr_deaths_est_logistic_lin_time_lin_post_tx_2yr <- attr_death_compute(sensitivity_anlys_event_study_data_lin_post_tx_2yr,
+                                                                        sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx, 
+                                                                        tx_name = c("int_2_yr_effect", "lag_num_pd_w_tx"),
+                                                                        var_cov_mat_beta_logistic_tx_two_yr)
+attr_deaths_est_logistic_lin_time_lin_post_tx_2yr <- merge(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr, date_data_2yr, 
+                                                           by.x = "Time_Period", by.y = "Time_Period_ID")
+
+attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary <- attr_deaths_est_logistic_lin_time_lin_post_tx_2yr %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(attr_deaths = sum(attr_deaths),
+            attr_deaths_lb = sum(attr_deaths_lb),
+            attr_deaths_ub = sum(attr_deaths_ub))
+
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary$attr_deaths)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary$attr_deaths_lb)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary$attr_deaths_ub)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary$attr_deaths)/
+  sum(sensitivity_anlys_event_study_data_lin_post_tx_2yr$imputed_deaths)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary$attr_deaths_lb)/
+  sum(sensitivity_anlys_event_study_data_lin_post_tx_2yr$imputed_deaths)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary$attr_deaths_ub)/
+  sum(sensitivity_anlys_event_study_data_lin_post_tx_2yr$imputed_deaths)
+
+ggplot(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+## Linear Policy Measures Post Tx Subset Logistic Model
+```{r}
+sens_data_subset <- sensitivity_anlys_event_study_data_lin_post_tx_2yr %>%
+  filter(Time_Period_ID <= 30)
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr<-gam(cbind(round(imputed_deaths), round(num_alive))~ State +
+                                                                  s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                                  Naloxone_Pharmacy_Yes_Redefined + 
+                                                                  lag_num_pd_w_naloxone_yes +
+                                                                  Naloxone_Pharmacy_No_Redefined + 
+                                                                  lag_num_pd_w_naloxone_no +
+                                                                  Medical_Marijuana_Redefined + 
+                                                                  lag_num_pd_w_med_marijuana +
+                                                                  Recreational_Marijuana_Redefined + 
+                                                                  lag_num_pd_w_rec_marijuana +
+                                                                  GSL_Redefined + 
+                                                                  lag_num_pd_w_gsl +
+                                                                  PDMP_Redefined + 
+                                                                  lag_num_pd_w_pdmp +
+                                                                  Medicaid_Expansion_Redefined +
+                                                                  lag_num_pd_w_medicaid +
+                                                                  int_2_yr_effect +
+                                                                  lag_num_pd_w_tx,
+                                                                data = sens_data_subset,
+                                                                family = "binomial")
+summary(sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr)
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_logistic_fixed_lin_time_lin_post_tx_subset_2yr <-
+  model.matrix(sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr)
+
+#estimate the 95% CI and SD
+coefficient_values_logistic_fixed_lin_time_lin_post_tx_subset_2yr <- coef(sensitivity_anlys_lin_post_tx_model_linear_time_subset_2yr)
+#type = "response" to get the estimated probabilities
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset_w_cov <-
+  compute_sd_and_CI_logistic(full_df_w_basis_functions_logistic_fixed_lin_time_lin_post_tx_subset_2yr,
+                    (sens_data_subset$prop_dead),
+                    coefficient_values_logistic_fixed_lin_time_lin_post_tx_subset_2yr,
+                    k = ncol(full_df_w_basis_functions_logistic_fixed_lin_time_lin_post_tx_subset_2yr),
+                    print_full_cov = TRUE)
+# format(round(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset,4)
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset <-
+  sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset_w_cov[[1]]
+
+colnames(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset) <- c("conf.low", "estimate", "conf.high", "exp_lb",
+                                                                                  "exp_coef", "exp_ub", "sd")
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term <-
+  rownames(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset)
+
+
+sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$ci_95 <- 
+  paste("95% CI = (", format(round(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.low, 3), nsmall = 3), ", ", 
+        format(round(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.high, 3), nsmall = 3), ")", sep = "")
+
+dwplot(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset[51:66,], colour = "black") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Term", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Analysis With Smoothed Time Effects, 
+       2 Year Linear Intervention, Subset Data") + 
+  scale_color_grey()  + 
+  geom_text(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset[51:66,], 
+            mapping = aes(label = format(round(estimate, 3), nsmall = 3), x = 0.55, y = 16:1), size = 3) + 
+  geom_text(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset[51:66,], 
+            mapping = aes(label = ci_95, x = 0.9, y = 16:1), size = 3) +
+  xlim(-.5, 1.1)
+```
+
+```{r}
+table_of_RR_lin_eff_logistic_2_yr_subset<- sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset[51:66,]
+table_of_RR_lin_eff_logistic_2_yr_subset$estimate <- round(exp(table_of_RR_lin_eff_logistic_2_yr_subset$estimate), 3)
+table_of_RR_lin_eff_logistic_2_yr_subset$conf.low <- exp(table_of_RR_lin_eff_logistic_2_yr_subset$conf.low)
+table_of_RR_lin_eff_logistic_2_yr_subset$conf.high <- exp(table_of_RR_lin_eff_logistic_2_yr_subset$conf.high)
+table_of_RR_lin_eff_logistic_2_yr_subset$ci_95 <- paste("95% CI = (", 
+                                                        format(round(table_of_RR_lin_eff_logistic_2_yr_subset$conf.low, 4), nsmall = 4), 
+                                                        ", ", 
+                                                        format(round(table_of_RR_lin_eff_logistic_2_yr_subset$conf.high, 4), nsmall = 4),
+                                                        ")", sep = "")
+
+# write.csv(table_of_RR_lin_eff_logistic_2_yr_subset, "./Data/table_of_RR_lin_eff_logistic_2_yr_subset_5_13_22.csv")
+table_of_RR_lin_eff_logistic_2_yr_subset
+```
+
+
+### Plot Effects
+```{r}
+plot_data_subset_data <- data.frame(time_after_tx = 0:28,
+                                    coef = sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$estimate[
+                                      sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                      sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$estimate[
+                                        sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term ==
+                                          "lag_num_pd_w_tx"]*c(0:28),
+                                    conf.low = sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                      sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                      sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                        sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term ==
+                                          "lag_num_pd_w_tx"]*c(0:28),
+                                    conf.high = sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                      sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                      sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                        sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term ==
+                                          "lag_num_pd_w_tx"]*c(0:28))
+
+ggplot(plot_data_subset_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = coef, linetype = "Estimated Effect")) + 
+  geom_line(aes(y = conf.low, linetype = "95% CI")) + 
+  geom_line(aes(y = conf.high, linetype = "95% CI")) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Effect",
+       title = "Estimated Effect of DIH Prosecutions Reported in the Media on 
+       Drug OD Deaths by Number of Periods After Exposure, 
+       Assuming Two Year Effect, Without Last 5 Years") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 0), color = "grey", linetype = "dotted")
+```
+
+
+
+### Attributable Deaths
+```{r}
+date_data_subset_2yr <- sens_data_subset[, c("Time_Period_ID", "Time_Period_Start")]
+date_data_subset_2yr <- date_data_subset_2yr[!duplicated(date_data_subset_2yr),]
+var_cov_mat_beta_logistic_tx_two_yr_subset <- as.matrix(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset_w_cov[[2]][
+  c("int_2_yr_effect", "lag_num_pd_w_tx"), c("int_2_yr_effect", "lag_num_pd_w_tx")])
+attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr <- attr_death_compute(sens_data_subset,
+                                                                        sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset,
+                                                                        tx_name = c("int_2_yr_effect", "lag_num_pd_w_tx"),
+                                                                        var_cov_mat_beta_logistic_tx_two_yr_subset)
+attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr <- merge(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr,
+                                                                  date_data_subset_2yr, 
+                                                                  by.x = "Time_Period", by.y = "Time_Period_ID")
+
+attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary <- attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr %>%
+  group_by(year = year(Time_Period_Start)) %>%
+  summarise(attr_deaths = sum(attr_deaths),
+            attr_deaths_ub = sum(attr_deaths_ub),
+            attr_deaths_lb = sum(attr_deaths_lb))
+
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_lb)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_ub)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths)/
+  sum(sens_data_subset$imputed_deaths)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_lb)/
+  sum(sens_data_subset$imputed_deaths)
+sum(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary$attr_deaths_ub)/
+  sum(sens_data_subset$imputed_deaths)
+
+ggplot(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr_summary, aes(x = year)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+# Plot All Effects
+## All Years
+```{r}
+plot_effects_all_yr_data <- data.frame(time_after_tx = rep(0:39, 4),
+                                       coef = c(
+                                         sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$estimate[
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "Intervention_Redefined"] + 
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$estimate[
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$estimate[
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "Intervention_Redefined"] + 
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$estimate[
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         c(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$estimate[
+                                           sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term == "Intervention_Redefined"] + 
+                                             sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$estimate[
+                                               sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28)),
+                                         c(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$estimate[
+                                           sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term == "Intervention_Redefined"] + 
+                                             sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$estimate[
+                                               sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28))),
+                                       conf.low = c(
+                                         sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.low[
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "Intervention_Redefined"] + 
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.low[
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.low[
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "Intervention_Redefined"] + 
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.low[
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         c(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$conf.low[
+                                           sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term == "Intervention_Redefined"] + 
+                                             sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$conf.low[
+                                               sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28)),
+                                         c(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$conf.low[
+                                           sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term == "Intervention_Redefined"] + 
+                                             sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$conf.low[
+                                               sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28))),
+                                       conf.high = c(
+                                         sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.high[
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "Intervention_Redefined"] + 
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.high[
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.high[
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "Intervention_Redefined"] + 
+                                           sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.high[
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         c(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$conf.high[
+                                           sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term == "Intervention_Redefined"] + 
+                                             sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$conf.high[
+                                               sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28)),
+                                         c(sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$conf.high[
+                                           sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term == "Intervention_Redefined"] + 
+                                             sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$conf.high[
+                                               sensitivity_anlys_post_tx_sd_and_ci_logistic_smoothed_time_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28))),
+                                       estimator = c(rep("Log Model with All Time Periods", 40),
+                                                     rep("Logistic GAM with All Time Periods", 40),
+                                                     rep("Log Model with Subset Time Periods", 40),
+                                                     rep("Logistic GAM with Subset Time Periods", 40)))
+
+pdf("./Figures/all_yr_effects_all_models_5_13_22.pdf")
+ggplot(plot_effects_all_yr_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = coef, linetype = "Estimated Effect", color = estimator)) + 
+  geom_line(aes(y = conf.low, linetype = "95% CI", color = estimator)) + 
+  geom_line(aes(y = conf.high, linetype = "95% CI", color = estimator)) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Effect",
+       color = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 0), color = "grey", linetype = "dotted")  + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+dev.off() 
+```
+
+```{r}
+attr_deaths_all_yr <- rbind(cbind(attr_deaths_est_log_smoothed_time_lin_post_summary, 
+                                  "estimator" = "Log Model with All Time Periods"),
+                            cbind(attr_deaths_est_logistic_smoothed_time_lin_post_summary, 
+                                  "estimator" = "Logistic GAM with All Time Periods"),
+                            cbind(attr_deaths_est_log_smoothed_time_lin_post_subset_summary, 
+                                  "estimator" = "Log Model with Subset Time Periods"),
+                            cbind(attr_deaths_est_logistic_smoothed_time_lin_post_subset_summary, 
+                                  "estimator" = "Logistc GAM with Subset Time Periods"))
+
+
+pdf("./Figures/lives_saved_all_yr_5_13_22.pdf")
+ggplot(attr_deaths_all_yr, aes(x = year, color = estimator)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = total_attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = total_attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = total_attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       # title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       # Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "",
+       color = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  scale_linetype_manual(values = c("dashed", "solid"))+ 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+dev.off()
+```
+
+
+## Two Years
+```{r}
+plot_effects_two_yr_data <- data.frame(time_after_tx = rep(0:39, 4),
+                                       coef = c(
+                                         sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$estimate[
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$estimate[
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         c(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$estimate[
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$estimate[
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28)),
+                                         c(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$estimate[
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$estimate[
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28))),
+                                       conf.low = c(
+                                         sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low[
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low[
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low[
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low[
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         c(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28)),
+                                         c(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.low[
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28))),
+                                       conf.high = c(
+                                         sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high[
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high[
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high[
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high[
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                         c(sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                           sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28)),
+                                         c(sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                           sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "int_2_yr_effect"] + 
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$conf.high[
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx_subset$term == "lag_num_pd_w_tx"]*c(0:28), 
+                                           rep(NA, 39 - 28))),
+                                       estimator = c(rep("Log Model with All Time Periods", 40),
+                                                     rep("Logistic GAM with All Time Periods", 40),
+                                                     rep("Log Model with Subset Time Periods", 40),
+                                                     rep("Logistic GAM with Subset Time Periods", 40)))
+
+pdf("./Figures/two_yr_effects_all_models_5_13_22.pdf")
+ggplot(plot_effects_two_yr_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = coef, linetype = "Estimated Effect", color = estimator)) + 
+  geom_line(aes(y = conf.low, linetype = "95% CI", color = estimator)) + 
+  geom_line(aes(y = conf.high, linetype = "95% CI", color = estimator)) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Effect",
+       color = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 0), color = "grey", linetype = "dotted")  + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+dev.off() 
+```
+
+```{r}
+attr_deaths_all_2yr <- rbind(cbind(attr_deaths_est_log_lin_time_lin_post_tx_2yr, "estimator" = "Log Model with All Time Periods"),
+                             cbind(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr, "estimator" = "Logistic GAM with All Time Periods"),
+                             cbind(attr_deaths_est_log_lin_time_lin_post_tx_subset_2yr, 
+                                   "estimator" = "Log Model with Subset Time Periods"),
+                             cbind(attr_deaths_est_logistic_lin_time_lin_post_tx_subset_2yr, 
+                                   "estimator" = "Logistc GAM with Subset Time Periods"))
+
+
+pdf("./Figures/lives_saved_all_2_yr_5_13_22.pdf")
+ggplot(attr_deaths_all_2yr, aes(x = Time_Period_Start, color = estimator)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       # title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       # Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "",
+       color = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  scale_linetype_manual(values = c("dashed", "solid"))+ 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE))
+dev.off()
+```
+
+## Log and Logistic Model All Years
+```{r}
+plot_effects_log_all_yr_data <- data.frame(time_after_tx = rep(0:39, 2),
+                                           coef = c(
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$estimate[
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "Intervention_Redefined"] + 
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$estimate[
+                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                                                 sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$estimate[
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "Intervention_Redefined"] + 
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$estimate[
+                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$estimate[
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$estimate[
+                                                 sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39)),
+                                           conf.low = c(
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.low[
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "Intervention_Redefined"] + 
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.low[
+                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low[
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.low[
+                                                 sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.low[
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "Intervention_Redefined"] + 
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.low[
+                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low[
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.low[
+                                                 sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39)),
+                                           conf.high = c(
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.high[
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "Intervention_Redefined"] + 
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$conf.high[
+                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high[
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                               sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$conf.high[
+                                                 sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.high[
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "Intervention_Redefined"] + 
+                                               sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$conf.high[
+                                                 sensitivity_anlys_lin_post_tx_sd_and_ci_logistic_smoothed_time$term == "lag_num_pd_w_tx"]*c(0:39),
+                                             sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high[
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                               sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$conf.high[
+                                                 sens_analysis_sd_and_ci_logistic_fixed_lin_time_lin_post_tx$term == "lag_num_pd_w_tx"]*c(0:39)),
+                                           model = c(rep("Log GAM: Lasting Effect", 40),
+                                                     rep("Log GAM: Two Year Effect", 40),
+                                                     rep("Logistic GAM: Lasting Effect", 40),
+                                                     rep("Logistic GAM: Two Year Effect", 40)))
+
+pdf("./Figures/log_and_logistic_models_all_yr_effects_5_13_22_RR.pdf")
+ggplot(plot_effects_log_all_yr_data, aes(x = time_after_tx)) + 
+  geom_line(aes(y = exp(coef), linetype = "Estimated Effect", color = model)) +
+  geom_point(aes(y = exp(coef), linetype = "Estimated Effect", shape = model, color = model)) +
+  geom_line(aes(y = exp(conf.low), linetype = "95% CI", color = model)) + 
+  geom_line(aes(y = exp(conf.high), linetype = "95% CI", color = model)) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Risk Ratio",
+       color = "", shape = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 1), color = "grey", linetype = "dotted")  + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE),
+         shape = guide_legend(nrow=2,byrow=TRUE)) + 
+  scale_shape_manual(values = c(19, 4, 17, 5))
+dev.off() 
+```
+
+```{r}
+attr_deaths_est_log_lin_time_lin_post_tx_2yr_wo_last_col <-
+  attr_deaths_est_log_lin_time_lin_post_tx_2yr[,c(1:(ncol(attr_deaths_est_log_lin_time_lin_post_tx_2yr) -1))]
+attr_deaths_est_log_lin_time_lin_post_tx_2yr_wo_last_col$Time_Period <-
+  year(attr_deaths_est_log_lin_time_lin_post_tx_2yr$Time_Period_Start)
+
+attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_wo_last_col <-
+  attr_deaths_est_logistic_lin_time_lin_post_tx_2yr[,c(1:(ncol(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr) -1))]
+attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_wo_last_col$Time_Period <- 
+  year(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr$Time_Period_Start)
+
+colnames(attr_deaths_est_log_smoothed_time_lin_post_summary) <- 
+  colnames(attr_deaths_est_logistic_smoothed_time_lin_post_summary) <-
+  colnames(attr_deaths_est_log_lin_time_lin_post_tx_2yr_wo_last_col) <-
+  colnames(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_wo_last_col) <-
+  c("Time_Period", "attr_deaths", "attr_deaths_lb", "attr_deaths_ub")
+
+attr_deaths_all_yr_effect <- rbind(cbind(attr_deaths_est_log_smoothed_time_lin_post_summary, "model" = "Log Model: Lasting Effect"),
+                                   cbind(attr_deaths_est_logistic_smoothed_time_lin_post_summary, "model" = "Logistic GAM: Lasting Effect"),
+                                   cbind(attr_deaths_est_log_lin_time_lin_post_tx_2yr_wo_last_col, "model" = "Log Model: Two Year Effect"),
+                                   cbind(attr_deaths_est_logistic_lin_time_lin_post_tx_2yr_wo_last_col, 
+                                         "model" = "Logistic GAM: Two Year Effect"))
+
+
+pdf("./Figures/lives_saved_main_models_5_13_22.pdf")
+ggplot(attr_deaths_all_yr_effect, aes(x = Time_Period, shape = model, color = model)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  geom_point(aes(y = attr_deaths)) +
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Lives Saved",
+       # title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       # Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "",
+       color = "",
+       shape = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  scale_linetype_manual(values = c("dashed", "solid"))+ 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE),
+         shape=guide_legend(nrow=2,byrow=TRUE))+ 
+  scale_shape_manual(values = c(19, 4, 17, 5))
+dev.off()
+```
+
+
+
+
+## Only Log Model All Years
+```{r}
+cov_mat_main_analysis <- sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time_w_cov[[2]]
+cov_mat_two_yr <- sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx_w_cov[[2]]
+
+plot_effects_only_log_all_yr_data <- data.frame(time_after_tx = rep(0:39, 2),
+                                                coef = c(
+                                                  sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$estimate[
+                                                    sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term ==
+                                                      "Intervention_Redefined"] + 
+                                                    sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$estimate[
+                                                      sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time$term ==
+                                                        "lag_num_pd_w_tx"]*c(0:39),
+                                                  sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                                                    sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term == "int_2_yr_effect"] + 
+                                                    sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$estimate[
+                                                      sens_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx$term ==
+                                                        "lag_num_pd_w_tx"]*c(0:39)))
+
+plot_effects_only_log_all_yr_data$conf.low <- c(plot_effects_only_log_all_yr_data$coef[1:40] - 
+  1.96*sqrt(cov_mat_main_analysis["Intervention_Redefined", "Intervention_Redefined"] + 
+      2*c(0:39)*cov_mat_main_analysis["Intervention_Redefined", "lag_num_pd_w_tx"] + 
+        c(0:39)^2*cov_mat_main_analysis["lag_num_pd_w_tx", "lag_num_pd_w_tx"]),
+  plot_effects_only_log_all_yr_data$coef[41:80] - 
+  1.96*sqrt(cov_mat_two_yr["int_2_yr_effect", "int_2_yr_effect"] + 
+      2*c(0:39)*cov_mat_two_yr["int_2_yr_effect", "lag_num_pd_w_tx"] + 
+        c(0:39)^2*cov_mat_two_yr["lag_num_pd_w_tx", "lag_num_pd_w_tx"]))
+
+plot_effects_only_log_all_yr_data$conf.high <- c(plot_effects_only_log_all_yr_data$coef[1:40] + 
+  1.96*sqrt(cov_mat_main_analysis["Intervention_Redefined", "Intervention_Redefined"] + 
+      2*c(0:39)*cov_mat_main_analysis["Intervention_Redefined", "lag_num_pd_w_tx"] + 
+        c(0:39)^2*cov_mat_main_analysis["lag_num_pd_w_tx", "lag_num_pd_w_tx"]),
+  plot_effects_only_log_all_yr_data$coef[41:80] +
+  1.96*sqrt(cov_mat_two_yr["int_2_yr_effect", "int_2_yr_effect"] + 
+      2*c(0:39)*cov_mat_two_yr["int_2_yr_effect", "lag_num_pd_w_tx"] + 
+        c(0:39)^2*cov_mat_two_yr["lag_num_pd_w_tx", "lag_num_pd_w_tx"]))
+
+plot_effects_only_log_all_yr_data$model  <- c(rep("Lasting Effect", 40), rep("Two-Year Effect", 40))
+
+
+
+pdf("./Figures/only_log_models_all_yr_effects_5_17_22_RR.pdf")
+ggplot(plot_effects_only_log_all_yr_data, mapping = aes(x = time_after_tx)) + 
+  geom_line(mapping = aes(y = exp(coef), linetype = "Estimated Effect", color = model)) +
+  geom_point(mapping = aes(y = exp(coef), linetype = "Estimated Effect", shape = model, color = model)) +
+  geom_line(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Lasting Effect",],
+            mapping = aes(y = exp(conf.low), linetype = "95% CI for Model with Lasting Effect", color = model)) + 
+  geom_line(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Lasting Effect",],
+            mapping = aes(y = exp(conf.high), linetype = "95% CI for Model with Lasting Effect", color = model)) + 
+  geom_line(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Two-Year Effect",],
+            mapping = aes(y = exp(conf.low), linetype = "95% CI for Model with Two-Year Effect", color = model)) + 
+  geom_line(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Two-Year Effect",],
+            mapping = aes(y = exp(conf.high), linetype = "95% CI for Model with Two-Year Effect", color = model)) + 
+  scale_linetype_manual(values = c("dashed", "dotdash", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Risk Ratio",
+       color = "", shape = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 1), color = "grey", linetype = "dotted")  + 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE),
+         shape = guide_legend(nrow=2,byrow=TRUE)) + 
+  scale_shape_manual(values = c(19, 4, 17, 5))
+dev.off() 
+
+
+pdf("./Figures/only_log_models_all_yr_effects_lasting_effect_6_3_22_RR.pdf", width = 5, height = 5)
+ggplot(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Lasting Effect",], 
+       mapping = aes(x = time_after_tx)) + 
+  geom_line(mapping = aes(y = exp(coef), linetype = "Estimated Effect")) +
+  # geom_point(mapping = aes(y = exp(coef), linetype = "Estimated Effect")) +
+  geom_line(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Lasting Effect",],
+            mapping = aes(y = exp(conf.low), linetype = "95% CI")) + 
+  geom_line(plot_effects_only_log_all_yr_data[plot_effects_only_log_all_yr_data$model == "Lasting Effect",],
+            mapping = aes(y = exp(conf.high), linetype = "95% CI")) + 
+  scale_linetype_manual(values = c("dashed", "solid")) + 
+  labs(linetype = "",
+       x = "Number of Periods After Treatment",
+       y = "Estimated Risk Ratio",
+       color = "", shape = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom") + 
+  geom_hline(aes(yintercept = 1), color = "grey", linetype = "dotted")  + 
+  # guides(color=guide_legend(nrow=2,byrow=TRUE),
+  #        linetype=guide_legend(nrow=2,byrow=TRUE),
+  #        shape = guide_legend(nrow=2,byrow=TRUE)) + 
+  scale_shape_manual(values = c(19, 4, 17, 5))
+dev.off() 
+
+```
+
+```{r}
+
+colnames(attr_deaths_est_log_smoothed_time_lin_post_summary) <- 
+  c("year", "attr_deaths", "attr_deaths_lb", "attr_deaths_ub")
+
+attr_deaths_all_yr_effect_only_log <- rbind(cbind(attr_deaths_est_log_smoothed_time_lin_post_summary, 
+                                                  "model" = "Lasting Effect"),
+                                            cbind(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary, "model" = "Two-Year Effect"))
+
+
+pdf("./Figures/lives_saved_only_log_models_5_17_22.pdf")
+ggplot(attr_deaths_all_yr_effect_only_log, mapping = aes(x = year, shape = model, color = model)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Lasting Effect",],
+            mapping = aes(y = attr_deaths, linetype = "Estimated Effect")) + 
+  geom_line(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Two-Year Effect",],
+            mapping = aes(y = attr_deaths, linetype = "Estimated Effect")) + 
+  geom_point(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Lasting Effect",],
+             mapping = aes(y = attr_deaths)) +
+  geom_point(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Two-Year Effect",],
+             mapping = aes(y = attr_deaths)) +
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Lasting Effect",],
+            mapping = aes(y = attr_deaths_lb, linetype = "95% CI for Model with Lasting Effect")) + 
+  geom_line(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Lasting Effect",],
+            mapping = aes(y = attr_deaths_ub, linetype = "95% CI for Model with Lasting Effect")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Two-Year Effect",],
+            mapping = aes(y = attr_deaths_ub, linetype = "95% CI for Model with Two-Year Effect")) + 
+  geom_line(attr_deaths_all_yr_effect_only_log[attr_deaths_all_yr_effect_only_log$model == "Two-Year Effect",],
+            mapping = aes(y = attr_deaths_lb, linetype = "95% CI for Model with Two-Year Effect")) +
+  labs(x = "Date", y = "Yearly Number of Lives Saved",
+       # title = "Estimated Number of Lives Saved Using Smoothed Time Effects, 
+       # Log Probability of Drug Overdose Death, 2 Year Linear Policy Effects",
+       linetype = "",
+       color = "",
+       shape = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        legend.position = "bottom",
+        legend.text = element_text(size = 8)) + 
+  scale_linetype_manual(values = c("dashed", "dotdash", "solid"))+ 
+  guides(color=guide_legend(nrow=2,byrow=TRUE),
+         linetype=guide_legend(nrow=2,byrow=TRUE),
+         shape=guide_legend(nrow=2,byrow=TRUE))+ 
+  scale_shape_manual(values = c(19, 4, 17, 5))
+dev.off()
+
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$attr_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$attr_deaths_lb)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$attr_deaths_ub)
+
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$attr_deaths)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$attr_deaths_lb)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_log_smoothed_time_lin_post_summary$attr_deaths_ub)/sum(main_analysis_data$imputed_deaths)
+
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_lb)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_ub)
+
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_lb)/sum(main_analysis_data$imputed_deaths)
+sum(attr_deaths_est_log_lin_time_lin_post_tx_2yr_summary$attr_deaths_ub)/sum(main_analysis_data$imputed_deaths)
+
+```
+
+

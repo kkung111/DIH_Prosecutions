@@ -1,0 +1,84 @@
+---
+title: "Age Distributions of OD Deaths"
+author: "Kelly Kung"
+date: "11/17/2021"
+output:   
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(echo = TRUE, root.dir = "~/OneDrive - Boston University/Research-Lok")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Set Up
+## R Code 
+```{r}
+#packages we need for this code file
+library(ggplot2)
+library(mgcv)
+library(lubridate)
+library(zoo)
+library(tidyverse)
+library(dplyr)
+library(DHARMa)
+library(mgcViz)
+library(extrafont)
+library(arm)
+loadfonts()
+library(stargazer)
+library(ellipse)
+```
+
+## Read in Data Set
+This dataset was pulled using the Wonder Tool from the CDC. 
+```{r}
+od_data <- read.csv("./Data/od_unintentional_by_age_gp_11_17_21.txt", sep = "\t", stringsAsFactors = FALSE)
+od_data$Deaths <- as.numeric(od_data$Deaths)
+View(od_data)
+od_data<-od_data[!is.na(od_data$Year),] #delete the rows that just contains data set description info
+tail(od_data)
+sum(is.na(od_data$Deaths))
+```
+
+# OD Deaths in each State For Each Group
+```{r}
+od_data %>%
+  group_by(State, Ten.Year.Age.Groups) %>%
+  summarise(sum(Deaths, na.rm = TRUE)) %>%
+  View()
+
+od_data %>%
+  group_by(Ten.Year.Age.Groups) %>%
+  summarise(total_deaths = sum(Deaths, na.rm = TRUE)) %>%
+  View()
+
+od_data$Ten.Year.Age.Groups[od_data$Ten.Year.Age.Groups == ""] <- "Total"
+od_data$Ten.Year.Age.Groups <- factor(od_data$Ten.Year.Age.Groups, 
+                                      levels = c("< 1 year", "1-4 years", "5-14 years", "15-24 years",
+                                      "25-34 years", "35-44 years", "45-54 years", "55-64 years",
+                                      "65-74 years", "75-84 years", "85+ years",  "Not Stated",  "Total" ))
+
+```
+
+# Five Year Groups
+```{r}
+od_five_yr_age_gp <- read.csv("./Data/od_deaths_5_yr_age_gp_11_17_21.txt", sep = "\t", stringsAsFactors = FALSE)
+View(od_five_yr_age_gp)
+od_five_yr_age_gp$Deaths <- as.numeric(od_five_yr_age_gp$Deaths)
+od_five_yr_age_gp<-od_five_yr_age_gp[!is.na(od_five_yr_age_gp$Year),] #delete the rows that just contains data set description info
+tail(od_five_yr_age_gp)
+sum(is.na(od_five_yr_age_gp$Deaths))
+
+od_five_yr_age_gp %>%
+  group_by(State, Five.Year.Age.Groups) %>%
+  summarise(sum(Deaths, na.rm = TRUE)) %>%
+  View()
+
+od_five_yr_age_gp %>%
+  group_by(Five.Year.Age.Groups) %>%
+  summarise(sum(Deaths, na.rm = TRUE)) %>%
+  View()
+```

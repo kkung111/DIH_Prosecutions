@@ -1,0 +1,2006 @@
+---
+title: "Analysis of DIH Prosecutions: 2000 to 2019, OLS"
+author: "Kelly Kung"
+date: "2/23/2022"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(echo = TRUE, root.dir = "~/OneDrive - Boston University/Research-Lok")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Set Up
+## R Code 
+```{r}
+#packages we need for this code file
+library(ggplot2)
+library(mgcv)
+library(lubridate)
+library(zoo)
+library(tidyverse)
+library(dplyr)
+library(DHARMa)
+library(mgcViz)
+library(extrafont)
+library(arm)
+loadfonts()
+library(stargazer)
+library(ellipse)
+library(dotwhisker)
+library(countreg)
+```
+
+```{r}
+#define functions we will need for analysis
+#expit function
+expit<-function(x){
+  return(exp(x)/(1 + exp(x)))
+}
+
+#logit function
+logit<-function(x){
+  return(log(x/(1 - x)))
+}
+```
+
+## Data 
+```{r}
+#read in data
+main_analysis_data<-read.csv("./Data/full_data_set_11_29_21_unintentional.csv")
+
+################################## set up data set ################################
+#add the intervention dates and time period data
+main_analysis_data$Intervention_First_Date<-as.Date(main_analysis_data$Intervention_First_Date)
+main_analysis_data$Time_Period_Start<-as.Date(main_analysis_data$Time_Period_Start)
+names(main_analysis_data)[which(colnames(main_analysis_data) == "sum_deaths")] <- "imputed_deaths"
+
+################################## set up the Regions ##############################
+#set up the regions according to Census: https://www.census.gov/geographies/reference-maps/2010/geo/2010-census-regions-and-divisions-of-the-united-states.html
+NE.name <- c("Connecticut","Maine","Massachusetts","New Hampshire",
+             "Rhode Island","Vermont","New Jersey","New York",
+             "Pennsylvania")
+
+MW.name <- c("Indiana","Illinois","Michigan","Ohio","Wisconsin",
+             "Iowa","Kansas","Minnesota","Missouri","Nebraska",
+             "North Dakota","South Dakota")
+
+S.name <- c("Delaware","District of Columbia","Florida","Georgia",
+            "Maryland","North Carolina","South Carolina","Virginia",
+            "West Virginia","Alabama","Kentucky","Mississippi",
+            "Tennessee","Arkansas","Louisiana","Oklahoma","Texas")
+
+W.name <- c("Arizona","Colorado","Idaho","New Mexico","Montana",
+            "Utah","Nevada","Wyoming","Alaska","California",
+            "Hawaii","Oregon","Washington")
+
+region.list <- list(
+  Northeast=NE.name,
+  Midwest=MW.name,
+  South=S.name,
+  West=W.name)
+
+#initialize vector with "West" and then impute the other regions for the states
+main_analysis_data$Region<-rep("West", nrow(main_analysis_data))
+for(state in unique(main_analysis_data$State)){
+  if(state %in% region.list$Northeast){
+    main_analysis_data$Region[main_analysis_data$State == state]<-"Northeast"
+  }else if(state %in% region.list$Midwest){
+    main_analysis_data$Region[main_analysis_data$State == state]<-"Midwest"
+  }else if(state %in% region.list$South){
+    main_analysis_data$Region[main_analysis_data$State == state]<-"South"
+  }
+}
+
+```
+
+# Sandwich Estimator Code
+```{r}
+#here, we estimate the variance-covariance matrix through the sandwich estimator
+#we create a function so that we don't have to keep writing the code:
+#cov_data is such that rows are state-time combinations and columns are the different policy measures
+#coef_values need to be in order of the columns of cov_data
+#z_value is the z-value that corresponds to the CI. We default to 95% CI so we default to 1.96
+#we take p as the number of parametesr for a bias correction
+
+compute_sd_and_CI <- function(cov_data, observed_y, coef_values, z_value = 1.96, p,
+                              print_full_cov = FALSE){
+  middle_term <- matrix(0, nrow = ncol(cov_data), ncol = ncol(cov_data))
+  for(i in 1:nrow(cov_data)){
+    #sum_{s,t} (z_{s,t}z_{s,t}^T)*(y_{s,t}-z_{s,t}^T theta)^2
+    middle_term <- middle_term + tcrossprod(as.matrix(cov_data[i,]))*
+      as.numeric((observed_y[i] - t(as.matrix(cov_data[i,]))%*%coef_values)^2)
+  }
+  #(Z^T Z)^{-1}*middle_term*(Z^T Z)^{-1}
+  var_cov <- solve(crossprod(cov_data))%*%(middle_term)%*%solve(crossprod(cov_data))*(nrow(cov_data)/(nrow(cov_data) - p))
+  #we obtain the standard deviations by taking the square root of the diagonal of the variance-covariance matrix.
+  sd_of_coefficients <- sqrt(diag(var_cov))
+  
+  #find the CI for the coefficients
+  lb_coef <- coef_values - z_value*(sd_of_coefficients)
+  ub_coef <- coef_values + z_value*(sd_of_coefficients)
+  
+  return_data_set <- data.frame(lb_coef, coef_values, ub_coef, sd_coef = sd_of_coefficients)
+  
+  if(print_full_cov){
+    return(list(return_data_set = return_data_set, var_cov = var_cov))
+  }else{
+    return(return_data_set)
+  }
+}
+
+
+```
+
+# Attributable Deaths Computation
+```{r}
+attr_death_compute <- function(data, coef_data, post_tx_model = TRUE, tx_name = NULL){
+  attr_table <- data.frame(matrix(NA, nrow = unique(data$Time_Period_ID), ncol = 4)) 
+  
+  for(time in unique(data$Time_Period_ID)){
+    #filter data to time period t
+    time_data <- data %>%
+      filter(Time_Period_ID == time)
+    
+    #obtain the population
+    pop <- sum(time_data$population)
+    
+    #obtain the estimated probability had intervention not occurred
+    if(post_tx_model == TRUE){
+      est_prob_no_int <- exp(log(time_data$prop_dead) - apply(sapply(0:39, function(k){time_data[,paste("pos_", k, "_pd", sep = "")]*
+          coef_data[paste("pos_", k, "_pd", sep = ""), "coef_values"]}), 1, sum))
+    }else{
+      est_prob_no_int <- exp(log(time_data$prop_dead) - time_data[tx_name]*coef_data[tx_name, "coef_values"])
+    }
+    
+    #estimated number of OD had intervention not occurred
+    n_od_no_int <- pop*est_prob_no_int
+    
+    #obtain LB
+    if(post_tx_model == TRUE){
+      est_prob_no_int_lb <- exp(log(time_data$prop_dead) - apply(sapply(0:39, function(k){time_data[,paste("pos_", k, "_pd", sep = "")]*
+          coef_data[paste("pos_", k, "_pd", sep = ""), "lb_coef"]}), 1, sum))
+    }else{
+      est_prob_no_int_lb <- exp(log(time_data$prop_dead) - time_data[tx_name]*coef_data[tx_name, "lb_coef"])
+    }
+    n_od_no_int_lb <- pop*est_prob_no_int_lb
+    
+    #obtain UB
+    if(post_tx_model == TRUE){
+      est_prob_no_int_ub <- exp(log(time_data$prop_dead) - apply(sapply(0:39, function(k){time_data[,paste("pos_", k, "_pd", sep = "")]*
+          coef_data[paste("pos_", k, "_pd", sep = ""), "ub_coef"]}), 1, sum))
+    }else{
+      est_prob_no_int_ub <- exp(log(time_data$prop_dead) - time_data[tx_name]*coef_data[tx_name, "ub_coef"])
+    }
+    n_od_no_int_ub <- pop*est_prob_no_int_ub
+
+    
+    attr_table[time,] <- c(time, sum(time_data$imputed_deaths) - sum(n_od_no_int), 
+                        sum(time_data$imputed_deaths) - sum(n_od_no_int_lb), 
+                        sum(time_data$imputed_deaths - n_od_no_int_ub))
+    
+    
+  }
+  colnames(attr_table) <- c("Time_Period", "attr_deaths", "attr_deaths_lb", "attr_deaths_ub")
+  attr_table
+}
+
+
+```
+
+# Event Study Data Creation
+```{r}
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+#create the dataset for the event study to check for pre-trend analysis
+time_data_int <- main_analysis_data %>%
+  #group by the state
+  group_by(State) %>%
+  #find the time interval ID for the intervention time
+  summarise(intervention_time_id = ifelse(floor_date(Intervention_First_Date, "6 months") == Time_Period_Start, Time_Period_ID, NA)) %>%
+  #filter out the other time periods that aren't the intervention date
+  filter(!is.na(intervention_time_id))
+
+#merge the time_data_int with the main dataset
+merged_main_time_data_int <- merge(main_analysis_data, time_data_int, by = "State", all.x = TRUE)
+
+#create the columns that associate with the periods before the intervention
+#the max number of periods before the intervention is determined by the maximum time period of the intervention
+neg_periods_df <- sapply(1:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 1),
+#the indicator for x periods before intervention is equal to 1 if the time ID of intervention minus time ID is equal to x
+                         function(x){ifelse(merged_main_time_data_int$intervention_time_id - 
+                                              merged_main_time_data_int$Time_Period_ID == x, 1, 0)})
+
+#create the column names
+colnames(neg_periods_df) <- sapply(1:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 1), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")})
+#add in the state and time ID columns
+neg_periods_df <- cbind(neg_periods_df, "State" = merged_main_time_data_int$State, 
+                        "Time_Period_ID" = merged_main_time_data_int$Time_Period_ID)
+#for Hawaii, impute a 0 because it is NA right now
+neg_periods_df[neg_periods_df[,"State"] == "Hawaii", 1:34] <- 0
+
+#create the columns that associate with the periods after the intervention
+#the max number of periods after the intervention is determined by the maximum Time ID minus the minus time period of the intervention
+#the period 0 is associated with intervention time
+pos_periods_df <- sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                         function(x){ifelse(merged_main_time_data_int$Time_Period_ID - 
+                                              merged_main_time_data_int$intervention_time_id == x, 1, 0)})
+#create the column names
+colnames(pos_periods_df) <- sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})
+#add in the state and time ID columns
+pos_periods_df <- cbind(pos_periods_df, "State" = merged_main_time_data_int$State, 
+                        "Time_Period_ID" = merged_main_time_data_int$Time_Period_ID)
+#for Hawaii, impute a 0 because it is NA right now
+pos_periods_df[pos_periods_df[,"State"] == "Hawaii", 1:40] <- 0
+
+#merge the columns of indicators for before and after the intervention with the main analysis data to create the dataset for event study
+sensitivity_anlys_event_study_data <- merge(main_analysis_data, 
+                                            neg_periods_df, by = c("State", "Time_Period_ID"))
+
+sensitivity_anlys_event_study_data <- merge(sensitivity_anlys_event_study_data, 
+                                            pos_periods_df, by = c("State", "Time_Period_ID"))
+#change the indicator values to numeric type 
+neg_1_index <- which(colnames(sensitivity_anlys_event_study_data) == "neg_1_pd")
+pos_39_index <- which(colnames(sensitivity_anlys_event_study_data) == "pos_39_pd")
+
+sensitivity_anlys_event_study_data[, neg_1_index:pos_39_index] <- apply(sensitivity_anlys_event_study_data[, neg_1_index:pos_39_index], 
+                                                                      2, as.numeric)
+
+```
+
+
+
+
+# OLS Model Main Analysis With Smoothed Time Effects
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+
+#fit an OLS with smoothed time effects
+main_analysis_model<-gam(prop_dead~ State +
+                           s(Time_Period_ID, bs = "cr", by = as.factor(Region)) +
+                           Naloxone_Pharmacy_Yes_Redefined +
+                           Naloxone_Pharmacy_No_Redefined +
+                           Medical_Marijuana_Redefined +
+                           Recreational_Marijuana_Redefined +
+                           GSL_Redefined +
+                           PDMP_Redefined +
+                           Medicaid_Expansion_Redefined +
+                           Intervention_Redefined ,
+                         data = main_analysis_data)
+
+summary(main_analysis_model)
+gam.check(main_analysis_model, page = 1)
+
+#examine fitted values
+summary(fitted(main_analysis_model))
+hist(fitted(main_analysis_model))
+
+plot(main_analysis_model, pages = 1)
+```
+
+## Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions <- as.matrix(data.frame(predict(main_analysis_model, type = "lpmatrix")))
+
+#estimate the 95% CI and SD
+coefficient_values <- coef(main_analysis_model)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci <- compute_sd_and_CI(full_df_w_basis_functions, main_analysis_data$prop_dead,
+                                             coefficient_values, p = ncol(full_df_w_basis_functions) - 50)
+main_analysis_sd_and_ci
+```
+
+
+
+
+
+
+## Event Study
+### Model Fitting
+```{r}
+#create a formula for the gam model which includes the state effects, smoothed time effects, policy measures, 
+#the periods before the intervention (excluding 1 period and 34 periods before intervention)
+#the intervention period, and the periods after the intervention
+
+formula_event_study <- formula(paste("prop_dead ~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)-2), 
+                                            function(x)paste("neg_", x, "_pd", sep = "")), collapse = "+"),
+                                     "+",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_event_study_model<-gam(formula_event_study,
+                                         data = sensitivity_anlys_event_study_data)
+
+summary(sensitivity_anlys_event_study_model)
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_event_study <- data.frame(predict(sensitivity_anlys_event_study_model, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_event_study <- coef(sensitivity_anlys_event_study_model)
+#type = "response" to get the estimated probabilities
+sensitivity_anlys_event_study_sd_and_ci <- compute_sd_and_CI(as.matrix(full_df_w_basis_functions_sensitivity_anlys_event_study), 
+                                                             sensitivity_anlys_event_study_data$prop_dead,
+                                                             coefficient_values_sensitivity_anlys_event_study,
+                                                             p = ncol(full_df_w_basis_functions_sensitivity_anlys_event_study) - 50)
+(sensitivity_anlys_event_study_sd_and_ci)
+# write.csv(round(sensitivity_anlys_event_study_sd_and_ci, 3), "./Data/event_study_coef_and_ci.csv")
+```
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study <- sensitivity_anlys_event_study_sd_and_ci %>%
+  mutate(term = rownames(sensitivity_anlys_event_study_sd_and_ci)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+## Analysis With Only Periods After Treatment
+```{r}
+formula_post_tx <- formula(paste("prop_dead~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model<-gam(formula_post_tx,
+                                         data = sensitivity_anlys_event_study_data)
+summary(sensitivity_anlys_post_tx_model)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx <- data.frame(predict(sensitivity_anlys_post_tx_model, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx <- coef(sensitivity_anlys_post_tx_model)
+
+sensitivity_anlys_post_tx_sd_and_ci <- compute_sd_and_CI(as.matrix(full_df_w_basis_functions_sensitivity_anlys_post_tx), 
+                                                         sensitivity_anlys_event_study_data$prop_dead,
+                                                         coefficient_values_sensitivity_anlys_post_tx,
+                                                         p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx) - 50)
+sensitivity_anlys_post_tx_sd_and_ci
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx <- sensitivity_anlys_post_tx_sd_and_ci %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx$num_states <- sapply(plot_post_tx$term, function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_vline(aes(xintercept = coef(main_analysis_model)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model)["Intervention_Redefined"]), y = 12, 
+            x = coef(main_analysis_model)["Intervention_Redefined"] + 0.00001), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+
+
+
+
+# OLS Model Main Analysis With Fixed Time Effects
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+
+#fit an OLS with smoothed time effects
+main_analysis_model_fixed_time<-lm(prop_dead~ State +
+                           factor(Time_Period_ID) +
+                           Naloxone_Pharmacy_Yes_Redefined +
+                           Naloxone_Pharmacy_No_Redefined +
+                           Medical_Marijuana_Redefined +
+                           Recreational_Marijuana_Redefined +
+                           GSL_Redefined +
+                           PDMP_Redefined +
+                           Medicaid_Expansion_Redefined +
+                           Intervention_Redefined ,
+                         data = main_analysis_data)
+
+summary(main_analysis_model_fixed_time)
+
+#examine fitted values
+summary(fitted(main_analysis_model_fixed_time))
+hist(fitted(main_analysis_model_fixed_time))
+par(mfrow = c(2,2))
+plot(main_analysis_model_fixed_time)
+```
+
+## Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_fixed_time <- model.matrix(main_analysis_model_fixed_time)
+
+#estimate the 95% CI and SD
+coefficient_values_fixed_time <- coef(main_analysis_model_fixed_time)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_fixed_time <- compute_sd_and_CI(full_df_w_basis_functions_fixed_time, main_analysis_data$prop_dead,
+                                             coefficient_values_fixed_time, 
+                                             p = ncol(full_df_w_basis_functions_fixed_time) - 50)
+main_analysis_sd_and_ci_fixed_time
+```
+
+
+
+
+
+
+## Event Study
+### Model Fitting
+```{r}
+#create a formula for the gam model which includes the state effects, smoothed time effects, policy measures, 
+#the periods before the intervention (excluding 1 period and 34 periods before intervention)
+#the intervention period, and the periods after the intervention
+
+formula_event_study_fixed_time <- formula(paste("prop_dead ~ State +
+                                           factor(Time_Period_ID)  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)-2), 
+                                            function(x)paste("neg_", x, "_pd", sep = "")), collapse = "+"),
+                                     "+",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_event_study_model_fixed_time<-lm(formula_event_study_fixed_time,
+                                         data = sensitivity_anlys_event_study_data)
+
+summary(sensitivity_anlys_event_study_model_fixed_time)
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_event_study_fixed_time <- model.matrix(sensitivity_anlys_event_study_model_fixed_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_event_study_fixed_time <- coef(sensitivity_anlys_event_study_model_fixed_time)
+#type = "response" to get the estimated probabilities
+sensitivity_anlys_event_study_sd_and_ci_fixed_time <-
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_event_study_fixed_time), 
+                    sensitivity_anlys_event_study_data$prop_dead,
+                    coefficient_values_sensitivity_anlys_event_study_fixed_time,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_event_study_fixed_time) - 50)
+(sensitivity_anlys_event_study_sd_and_ci_fixed_time)
+# write.csv(round(sensitivity_anlys_event_study_sd_and_ci, 3), "./Data/event_study_coef_and_ci.csv")
+```
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_fixed_time <- sensitivity_anlys_event_study_sd_and_ci_fixed_time %>%
+  mutate(term = rownames(sensitivity_anlys_event_study_sd_and_ci_fixed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_fixed_time) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_fixed_time, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+## Analysis With Only Periods After Treatment
+```{r}
+formula_post_tx_fixed_time <- formula(paste("prop_dead~ State +
+                                           factor(Time_Period_ID)  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model_fixed_time<-lm(formula_post_tx_fixed_time,
+                                         data = sensitivity_anlys_event_study_data)
+summary(sensitivity_anlys_post_tx_model_fixed_time)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_fixed_time <- model.matrix(sensitivity_anlys_post_tx_model_fixed_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_fixed_time <- coef(sensitivity_anlys_post_tx_model_fixed_time)
+
+sensitivity_anlys_post_tx_sd_and_ci_fixed_time <- compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_post_tx_fixed_time), 
+                                                         sensitivity_anlys_event_study_data$prop_dead,
+                                                         coefficient_values_sensitivity_anlys_post_tx_fixed_time, 
+                                                         p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_fixed_time) - 50)
+sensitivity_anlys_post_tx_sd_and_ci_fixed_time
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_fixed_time <- sensitivity_anlys_post_tx_sd_and_ci_fixed_time %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_fixed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_fixed_time) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_fixed_time$num_states <- sapply(plot_post_tx_fixed_time$term, function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_fixed_time, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_vline(aes(xintercept = coef(main_analysis_model_fixed_time)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_fixed_time)["Intervention_Redefined"]), y = 12, 
+            x = coef(main_analysis_model_fixed_time)["Intervention_Redefined"] + 0.00001), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+
+
+
+
+# OLS Model Main Analysis With Smoothed Time Effects With Log Proportion 
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+
+#fit an OLS with smoothed time effects
+main_analysis_model_log_smoothed_time<-gam(log(prop_dead)~ State +
+                           s(Time_Period_ID, bs = "cr", by = as.factor(Region)) +
+                           Naloxone_Pharmacy_Yes_Redefined +
+                           Naloxone_Pharmacy_No_Redefined +
+                           Medical_Marijuana_Redefined +
+                           Recreational_Marijuana_Redefined +
+                           GSL_Redefined +
+                           PDMP_Redefined +
+                           Medicaid_Expansion_Redefined +
+                           Intervention_Redefined ,
+                         data = main_analysis_data)
+
+summary(main_analysis_model_log_smoothed_time)
+gam.check(main_analysis_model_log_smoothed_time, page = 1)
+
+#examine fitted values
+summary(fitted(main_analysis_model_log_smoothed_time))
+hist(fitted(main_analysis_model_log_smoothed_time))
+
+#smoothed effects
+plot(main_analysis_model_log_smoothed_time, pages = 1)
+```
+
+## Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_smoothed_time <- as.matrix(data.frame(predict(main_analysis_model_log_smoothed_time, type = "lpmatrix")))
+
+#estimate the 95% CI and SD
+coefficient_values_log_smoothed_time <- coef(main_analysis_model_log_smoothed_time)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_log_smoothed_time <- compute_sd_and_CI(full_df_w_basis_functions_log_smoothed_time,
+                                                               log(main_analysis_data$prop_dead),
+                                                               coefficient_values_log_smoothed_time,
+                                                               p = ncol(full_df_w_basis_functions_log_smoothed_time) - 50)
+round(main_analysis_sd_and_ci_log_smoothed_time, 3)
+```
+
+### Attributable Deaths
+```{r}
+date_data <- main_analysis_data[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_smoothed_time <- attr_death_compute(main_analysis_data, main_analysis_sd_and_ci_log_smoothed_time, 
+                                                        post_tx_model = FALSE, tx_name = "Intervention_Redefined")
+attr_deaths_est_log_smoothed_time <- merge(attr_deaths_est_log_smoothed_time, date_data, by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_smoothed_time, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Attributable Deaths",
+       title = "Estimated Number of Attributable Deaths Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+
+
+
+## Event Study
+### Model Fitting
+```{r}
+#create a formula for the gam model which includes the state effects, smoothed time effects, policy measures, 
+#the periods before the intervention (excluding 1 period and 34 periods before intervention)
+#the intervention period, and the periods after the intervention
+
+formula_event_study_log_smoothed_time <- formula(paste("log(prop_dead) ~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)-2), 
+                                            function(x)paste("neg_", x, "_pd", sep = "")), collapse = "+"),
+                                     "+",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_event_study_model_log_smoothed_time<-gam(formula_event_study_log_smoothed_time,
+                                         data = sensitivity_anlys_event_study_data)
+
+summary(sensitivity_anlys_event_study_model_log_smoothed_time)
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_event_study_log_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_event_study_model_log_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_event_study_log_smoothed_time <- coef(sensitivity_anlys_event_study_model_log_smoothed_time)
+#type = "response" to get the estimated probabilities
+sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time <-
+  compute_sd_and_CI(as.matrix(full_df_w_basis_functions_sensitivity_anlys_event_study_log_smoothed_time), 
+                                                             log(sensitivity_anlys_event_study_data$prop_dead),
+                                                             coefficient_values_sensitivity_anlys_event_study_log_smoothed_time,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_event_study_log_smoothed_time) - 50)
+(sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time)
+# write.csv(round(sensitivity_anlys_event_study_sd_and_ci, 3), "./Data/event_study_coef_and_ci.csv")
+```
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_log_smoothed_time <- sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time %>%
+  mutate(term = rownames(sensitivity_anlys_event_study_sd_and_ci_log_smoothed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_log_smoothed_time) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_log_smoothed_time, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+
+### Plot with Model SD
+```{r}
+#compute the full dataset including basis functions
+summary_model_log_smoothed <- summary(sensitivity_anlys_event_study_model_log_smoothed_time)
+coef_values_log_smoothed <- data.frame(coef_values = coef(sensitivity_anlys_event_study_model_log_smoothed_time), 
+                                       lb_coef = coef(sensitivity_anlys_event_study_model_log_smoothed_time) -
+                                         1.96*summary_model_log_smoothed$se,
+                                       ub_coef = coef(sensitivity_anlys_event_study_model_log_smoothed_time) +
+                                         1.96*summary_model_log_smoothed$se,
+                                       sd_coef = summary_model_log_smoothed$se)
+```
+
+
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_log_smoothed_time_sd_model <- coef_values_log_smoothed %>%
+  mutate(term = rownames(coef_values_log_smoothed)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_log_smoothed_time_sd_model) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_log_smoothed_time_sd_model, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+## Analysis With Only Periods After Treatment
+```{r}
+formula_post_tx_log_smoothed_time <- formula(paste("log(prop_dead)~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model_log_smoothed_time<-gam(formula_post_tx_log_smoothed_time,
+                                         data = sensitivity_anlys_event_study_data)
+summary(sensitivity_anlys_post_tx_model_log_smoothed_time)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_post_tx_model_log_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time <- coef(sensitivity_anlys_post_tx_model_log_smoothed_time)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time <- 
+  compute_sd_and_CI(as.matrix(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time), 
+                    log(sensitivity_anlys_event_study_data$prop_dead),
+                    coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time, 
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time) - 50)
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_smoothed_time <- sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_smoothed_time) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_smoothed_time$num_states <- sapply(plot_post_tx_log_smoothed_time$term,
+                                                    function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_log_smoothed_time, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() 
+  # geom_vline(aes(xintercept = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+  # geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), y = 12, 
+  #           x = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"] + 0.1), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+### Attributable Deaths
+```{r}
+date_data <- sensitivity_anlys_event_study_data[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_smoothed_time_post_tx <- attr_death_compute(sensitivity_anlys_event_study_data,
+                                                                sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time)
+attr_deaths_est_log_smoothed_time_post_tx <- merge(attr_deaths_est_log_smoothed_time_post_tx, date_data, 
+                                               by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_smoothed_time_post_tx, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Attributable Deaths",
+       title = "Estimated Number of Attributable Deaths Using Semi-Dynamic Model",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+### Model With Semi Dynamic Regression
+```{r,, eval = FALSE}
+coef_semi_dynamic <- data.frame(matrix(NA, nrow = 40, ncol = 4))
+for(time in 0:39){
+  subset_data <- sensitivity_anlys_event_study_data %>%
+    filter(get(paste("pos_", time, "_pd", sep = "")) == 1 | 
+             Time_Period_Start <= Intervention_First_Date)
+  formula_semi_dynamic <- formula(paste("log(prop_dead)~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                        paste("pos_", time, "_pd", sep = "")))
+  #run the gam model
+  semi_dynamic_model<-gam(formula_semi_dynamic, data = subset_data)
+  summary_semi_dynamic_model <- summary(semi_dynamic_model)
+  sd_semi_dynamic_model <- summary_semi_dynamic_model$se[paste("pos_", time, "_pd", sep = "")]
+  
+  coef_value <- coef(semi_dynamic_model)[paste("pos_", time, "_pd", sep = "")]
+  
+  coef_semi_dynamic[time + 1,] <- c(time, coef_value, coef_value - 1.96*sd_semi_dynamic_model, coef_value + 1.96*sd_semi_dynamic_model)
+}
+
+colnames(coef_semi_dynamic) <- c("time_after_tx", "estimate", "lb", "ub")
+
+ggplot(coef_semi_dynamic, aes(y = estimate, x = time_after_tx)) + 
+  geom_pointrange(aes(ymin = lb, ymax = ub), fatten = 1)
+```
+
+
+
+
+## Analysis With Only Periods After Treatment with Model SD
+```{r}
+summary_model_log_smoothed_post_tx <- summary(sensitivity_anlys_post_tx_model_log_smoothed_time)
+coef_values_log_smoothed_post_tx <- data.frame(coef_values = coef(sensitivity_anlys_post_tx_model_log_smoothed_time), 
+                                       lb_coef = coef(sensitivity_anlys_post_tx_model_log_smoothed_time) -
+                                         1.96*summary_model_log_smoothed_post_tx$se,
+                                       ub_coef = coef(sensitivity_anlys_post_tx_model_log_smoothed_time) +
+                                         1.96*summary_model_log_smoothed_post_tx$se,
+                                       sd_coef = summary_model_log_smoothed_post_tx$se)
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_smoothed_time_post_tx <- coef_values_log_smoothed_post_tx %>%
+  mutate(term = rownames(coef_values_log_smoothed_post_tx)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_smoothed_time_post_tx) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_smoothed_time_post_tx$num_states <- sapply(plot_post_tx_log_smoothed_time_post_tx$term,
+                                                    function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_log_smoothed_time_post_tx, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_vline(aes(xintercept = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), y = 12, 
+            x = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"] + 0.1), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+
+
+
+## Analysis With Linear Periods After Treatment
+```{r}
+#use this function to compute the cumulative sum, but resets the sum if the variable was 0
+compute_cumsum = function(x){
+    cs = cumsum(x)
+    cs - cummax((x == 0) * cs)
+}
+sensitivity_anlys_event_study_data_lin_post_tx <- sensitivity_anlys_event_study_data %>%
+  arrange(State, Time_Period_ID) %>%
+  group_by(State) %>%
+  mutate(sum_tx_periods = pos_0_pd + pos_1_pd + pos_2_pd + pos_3_pd + 
+           pos_4_pd + pos_5_pd + pos_6_pd + pos_7_pd + pos_8_pd + pos_9_pd + 
+           pos_10_pd + pos_11_pd + pos_12_pd + pos_13_pd + pos_14_pd + 
+           pos_15_pd + pos_16_pd + pos_17_pd + pos_18_pd + pos_19_pd + 
+           pos_20_pd + pos_21_pd + pos_22_pd + pos_23_pd + pos_24_pd + 
+           pos_25_pd + pos_26_pd + pos_27_pd + pos_28_pd + pos_29_pd + 
+           pos_30_pd + pos_31_pd + pos_32_pd + pos_33_pd + pos_34_pd + 
+           pos_35_pd + pos_36_pd + pos_37_pd + pos_38_pd + pos_39_pd,
+         time_after_tx = cumsum(sum_tx_periods),
+         num_pd_w_tx = compute_cumsum(Intervention_Redefined ),
+         num_pd_w_naloxone_yes = compute_cumsum(Naloxone_Pharmacy_Yes_Redefined),
+         num_pd_w_naloxone_no = compute_cumsum(Naloxone_Pharmacy_No_Redefined),
+         num_pd_w_med_marijuana = compute_cumsum(Medical_Marijuana_Redefined),
+         num_pd_w_rec_marijuana = compute_cumsum(Recreational_Marijuana_Redefined),
+         num_pd_w_gsl = compute_cumsum(GSL_Redefined),
+         num_pd_w_pdmp = compute_cumsum(PDMP_Redefined),
+         num_pd_w_medicaid = compute_cumsum(Medicaid_Expansion_Redefined),
+         lag_num_pd_w_tx = lag(num_pd_w_tx),
+         lag_num_pd_w_naloxone_yes = lag(num_pd_w_naloxone_yes),
+         lag_num_pd_w_naloxone_no = lag(num_pd_w_naloxone_no),
+         lag_num_pd_w_med_marijuana = lag(num_pd_w_med_marijuana),
+         lag_num_pd_w_rec_marijuana = lag(num_pd_w_rec_marijuana),
+         lag_num_pd_w_gsl = lag(num_pd_w_gsl),
+         lag_num_pd_w_pdmp = lag(num_pd_w_pdmp),
+         lag_num_pd_w_medicaid = lag(num_pd_w_medicaid)) #lag so that intercept = effect when tx first occurs
+
+#fill in a 0 for the NAs so we keep all the data and at most this will be 0
+sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_tx[is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_tx)] <- 
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_naloxone_yes[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_naloxone_yes)]<-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_naloxone_no[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_naloxone_no)] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_med_marijuana[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_med_marijuana)] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_rec_marijuana[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_rec_marijuana)] <- 
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_gsl[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_gsl)] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_pdmp[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_pdmp)] <-
+  sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_medicaid[
+    is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_medicaid)] <-0
+
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_log_smoothed_time<-gam(log(prop_dead)~ State +
+                                                             s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                                             Naloxone_Pharmacy_Yes_Redefined + 
+                                                             lag_num_pd_w_naloxone_yes +
+                                                             Naloxone_Pharmacy_No_Redefined + 
+                                                             lag_num_pd_w_naloxone_no +
+                                                             Medical_Marijuana_Redefined + 
+                                                             lag_num_pd_w_med_marijuana +
+                                                             Recreational_Marijuana_Redefined + 
+                                                             lag_num_pd_w_rec_marijuana +
+                                                             GSL_Redefined + 
+                                                             lag_num_pd_w_gsl +
+                                                             PDMP_Redefined + 
+                                                             lag_num_pd_w_pdmp +
+                                                             Medicaid_Expansion_Redefined +
+                                                             lag_num_pd_w_medicaid +
+                                                             Intervention_Redefined +
+                                                             lag_num_pd_w_tx,
+                                                           data = sensitivity_anlys_event_study_data_lin_post_tx)
+summary(sensitivity_anlys_lin_post_tx_model_log_smoothed_time)
+
+plot(sensitivity_anlys_lin_post_tx_model_log_smoothed_time, pages = 1)
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_smoothed_time <-
+  data.frame(predict(sensitivity_anlys_lin_post_tx_model_log_smoothed_time, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_lin_post_tx_log_smoothed_time <- coef(sensitivity_anlys_lin_post_tx_model_log_smoothed_time)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time <- 
+  compute_sd_and_CI(as.matrix(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_smoothed_time), 
+                    log(sensitivity_anlys_event_study_data$prop_dead),
+                    coefficient_values_sensitivity_anlys_lin_post_tx_log_smoothed_time, 
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_smoothed_time) - 50)
+round(sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time, 3)
+```
+
+### Attributable Deaths
+```{r}
+date_data <- sensitivity_anlys_event_study_data_lin_post_tx[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_smoothed_time_lin_post <- attr_death_compute(sensitivity_anlys_event_study_data_lin_post_tx,
+                                                                sensitivity_anlys_lin_post_tx_sd_and_ci_log_smoothed_time, 
+                                                        post_tx_model = FALSE, tx_name = "num_pd_w_tx")
+attr_deaths_est_log_smoothed_time_lin_post <- merge(attr_deaths_est_log_smoothed_time_lin_post, date_data, 
+                                                    by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_smoothed_time_lin_post, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Attributable Deaths",
+       title = "Estimated Number of Attributable Deaths Using Smoothed Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+## Analysis With Only Periods After Treatment Subset Periods
+```{r}
+formula_post_tx_log_smoothed_time <- formula(paste("log(prop_dead)~ State +
+                                           s(Time_Period_ID, bs = 'cr', by = as.factor(Region))  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(29 - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+data_subset <- sensitivity_anlys_event_study_data[sensitivity_anlys_event_study_data$Time_Period_ID <= 29,]
+sensitivity_anlys_post_tx_model_log_smoothed_time_subset<-gam(formula_post_tx_log_smoothed_time,
+                                         data = data_subset)
+summary(sensitivity_anlys_post_tx_model_log_smoothed_time_subset)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time_subset <-
+  data.frame(predict(sensitivity_anlys_post_tx_model_log_smoothed_time_subset, type = "lpmatrix"))
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time_subset <- coef(sensitivity_anlys_post_tx_model_log_smoothed_time_subset)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset <- 
+  compute_sd_and_CI(as.matrix(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time_subset), 
+                    log(data_subset$prop_dead),
+                    coefficient_values_sensitivity_anlys_post_tx_log_smoothed_time_subset,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_smoothed_time_subset) - 50)
+sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_smoothed_time_subset <- sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_log_smoothed_time_subset)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(data_subset$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_smoothed_time_subset) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_smoothed_time_subset$num_states <- sapply(plot_post_tx_log_smoothed_time_subset$term,
+                                                    function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+plot_post_tx_data <- merge(plot_post_tx_log_smoothed_time, plot_post_tx_log_smoothed_time_subset, 
+                           by = "term", all.x = TRUE)
+plot_post_tx_data$term <- factor(plot_post_tx_data$term, 
+                                                     levels = sapply(0:39, function(x){paste("pos_", x, "_pd", sep = "")}))
+ggplot(plot_post_tx_data, aes(x = term)) +  
+  geom_point(plot_post_tx_data, mapping = aes(y = estimate.y, color = "subset data")) + 
+  geom_pointrange(plot_post_tx_data, 
+                  mapping = aes(x = term, y = estimate.y, ymin = conf.low.y, ymax = conf.high.y, color = "subset data"),
+                  fatten = 1, alpha = .5) + 
+  geom_point(plot_post_tx_data, mapping = aes(y = estimate.x, color = "full data")) + 
+  geom_pointrange(plot_post_tx_data, 
+                  mapping = aes(x = term, y = estimate.x, ymin = conf.low.x, ymax = conf.high.x, color = "full data"),
+                  fatten = 1, alpha = .5) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4),
+        legend.position = "bottom") +
+  geom_hline(aes(yintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods",
+       color = "Full Data or Subset Times") 
+  # geom_vline(aes(xintercept = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+  # geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"]), y = 12, 
+  #           x = coef(main_analysis_model_log_smoothed_time)["Intervention_Redefined"] + 0.1), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2) 
+
+  
+  
+
+```
+
+
+
+
+
+
+# OLS Model Main Analysis With Fixed Time Effects Interacted with Region With Log Proportion 
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+
+
+#fit an OLS with smoothed time effects
+main_analysis_model_log_fixed_time<-lm(log(prop_dead)~ State +
+                                         factor(Time_Period_ID) + 
+                                         Naloxone_Pharmacy_Yes_Redefined +
+                                         Naloxone_Pharmacy_No_Redefined +
+                                         Medical_Marijuana_Redefined +
+                                         Recreational_Marijuana_Redefined +
+                                         GSL_Redefined +
+                                         PDMP_Redefined +
+                                         Medicaid_Expansion_Redefined +
+                                         Intervention_Redefined ,
+                                       data = main_analysis_data)
+
+summary(main_analysis_model_log_fixed_time)
+
+#examine fitted values
+summary(fitted(main_analysis_model_log_fixed_time))
+hist(fitted(main_analysis_model_log_fixed_time))
+par(mfrow = c(2,2))
+plot(main_analysis_model_log_fixed_time)
+```
+
+## Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_fixed_time <- model.matrix(main_analysis_model_log_fixed_time)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_time <- coef(main_analysis_model_log_fixed_time)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_log_fixed_time <- compute_sd_and_CI(full_df_w_basis_functions_log_fixed_time, log(main_analysis_data$prop_dead),
+                                             coefficient_values_log_fixed_time,
+                                             p = ncol(full_df_w_basis_functions_log_fixed_time) - 50)
+main_analysis_sd_and_ci_log_fixed_time
+```
+
+
+
+
+
+
+## Event Study
+### Model Fitting
+```{r}
+#create a formula for the gam model which includes the state effects, smoothed time effects, policy measures, 
+#the periods before the intervention (excluding 1 period and 34 periods before intervention)
+#the intervention period, and the periods after the intervention
+
+formula_event_study_log_fixed_time <- formula(paste("log(prop_dead) ~ State +
+                                           factor(Time_Period_ID)  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)-2), 
+                                            function(x)paste("neg_", x, "_pd", sep = "")), collapse = "+"),
+                                     "+",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_event_study_model_log_fixed_time<-lm(formula_event_study_log_fixed_time,
+                                         data = sensitivity_anlys_event_study_data)
+
+summary(sensitivity_anlys_event_study_model_log_fixed_time)
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_event_study_log_fixed_time <- model.matrix(sensitivity_anlys_event_study_model_log_fixed_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_event_study_log_fixed_time <- coef(sensitivity_anlys_event_study_model_log_fixed_time)
+#type = "response" to get the estimated probabilities
+sensitivity_anlys_event_study_sd_and_ci_log_fixed_time <- 
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_event_study_log_fixed_time), 
+                                                             log(sensitivity_anlys_event_study_data$prop_dead),
+                                                             coefficient_values_sensitivity_anlys_event_study_log_fixed_time, 
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_event_study_log_fixed_time) - 50)
+(sensitivity_anlys_event_study_sd_and_ci_log_fixed_time)
+# write.csv(round(sensitivity_anlys_event_study_sd_and_ci, 3), "./Data/event_study_coef_and_ci.csv")
+```
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_log_fixed_time <- sensitivity_anlys_event_study_sd_and_ci_log_fixed_time %>%
+  mutate(term = rownames(sensitivity_anlys_event_study_sd_and_ci_log_fixed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_log_fixed_time) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_log_fixed_time, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+## Analysis With Only Periods After Treatment
+```{r}
+formula_post_tx_log_fixed_time <- formula(paste("log(prop_dead)~ State +
+                                           factor(Time_Period_ID)  +
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model_log_fixed_time<-lm(formula_post_tx_log_fixed_time,
+                                         data = sensitivity_anlys_event_study_data)
+summary(sensitivity_anlys_post_tx_model_log_fixed_time)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_time <- model.matrix(sensitivity_anlys_post_tx_model_log_fixed_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_fixed_time <- coef(sensitivity_anlys_post_tx_model_log_fixed_time)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_fixed_time <-
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_time), 
+                                                         log(sensitivity_anlys_event_study_data$prop_dead),
+                                                         coefficient_values_sensitivity_anlys_post_tx_log_fixed_time,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_time) - 50)
+sensitivity_anlys_post_tx_sd_and_ci_log_fixed_time
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_fixed_time <- sensitivity_anlys_post_tx_sd_and_ci_log_fixed_time %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_log_fixed_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_fixed_time) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_fixed_time$num_states <- sapply(plot_post_tx_log_fixed_time$term, function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_log_fixed_time, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_vline(aes(xintercept = coef(main_analysis_model_log_fixed_time)["Intervention_Redefined"]), linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_fixed_time)["Intervention_Redefined"]), y = 12, 
+            x = coef(main_analysis_model_log_fixed_time)["Intervention_Redefined"] + 0.1), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+
+
+
+# OLS Model Main Analysis With Linear Fixed Time Effects Interacted with Region With Log Proportion 
+```{r}
+#compute the proportion of people who died from drug overdose
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+
+
+#fit an OLS with smoothed time effects
+main_analysis_model_log_fixed_lin_time<-lm(log(prop_dead)~ State +
+                                         Time_Period_ID:Region +
+                                         I(Time_Period_ID^2):Region + 
+                                         Naloxone_Pharmacy_Yes_Redefined +
+                                         Naloxone_Pharmacy_No_Redefined +
+                                         Medical_Marijuana_Redefined +
+                                         Recreational_Marijuana_Redefined +
+                                         GSL_Redefined +
+                                         PDMP_Redefined +
+                                         Medicaid_Expansion_Redefined +
+                                         Intervention_Redefined ,
+                                       data = main_analysis_data)
+
+summary(main_analysis_model_log_fixed_lin_time)
+
+#examine fitted values
+summary(fitted(main_analysis_model_log_fixed_lin_time))
+hist(fitted(main_analysis_model_log_fixed_lin_time))
+par(mfrow = c(2,2))
+plot(main_analysis_model_log_fixed_lin_time)
+```
+
+## Coefficients and 95% CI
+```{r}
+
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_fixed_lin_time <- model.matrix(main_analysis_model_log_fixed_lin_time)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_lin_time <- coef(main_analysis_model_log_fixed_lin_time)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_log_fixed_lin_time <- compute_sd_and_CI(full_df_w_basis_functions_log_fixed_lin_time,
+                                                                log(main_analysis_data$prop_dead),
+                                             coefficient_values_log_fixed_lin_time,
+                                             p = ncol(full_df_w_basis_functions_log_fixed_lin_time) - 50)
+main_analysis_sd_and_ci_log_fixed_lin_time
+```
+
+
+
+### Attributable Deaths
+```{r}
+date_data <- main_analysis_data[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_lin_time <- attr_death_compute(main_analysis_data,
+                                                   main_analysis_sd_and_ci_log_fixed_lin_time, 
+                                                   post_tx_model = FALSE, tx_name = "Intervention_Redefined")
+attr_deaths_est_log_lin_time <- merge(attr_deaths_est_log_lin_time, date_data, 
+                                                    by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_lin_time, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Attributable Deaths",
+       title = "Estimated Number of Attributable Deaths Using Linear and Quad. Time Effects, 
+       Log Probability of Drug Overdose Death",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+
+
+
+## Linear Policy Measures
+```{r}
+#use this function to compute the cumulative sum, but resets the sum if the variable was 0
+compute_cumsum = function(x){
+    cs = cumsum(x)
+    cs - cummax((x == 0) * cs)
+}
+sensitivity_anlys_event_study_data_lin_post_tx <- sensitivity_anlys_event_study_data %>%
+  arrange(State, Time_Period_ID) %>%
+  group_by(State) %>%
+  mutate(sum_tx_periods = pos_0_pd + pos_1_pd + pos_2_pd + pos_3_pd + 
+           pos_4_pd + pos_5_pd + pos_6_pd + pos_7_pd + pos_8_pd + pos_9_pd + 
+           pos_10_pd + pos_11_pd + pos_12_pd + pos_13_pd + pos_14_pd + 
+           pos_15_pd + pos_16_pd + pos_17_pd + pos_18_pd + pos_19_pd + 
+           pos_20_pd + pos_21_pd + pos_22_pd + pos_23_pd + pos_24_pd + 
+           pos_25_pd + pos_26_pd + pos_27_pd + pos_28_pd + pos_29_pd + 
+           pos_30_pd + pos_31_pd + pos_32_pd + pos_33_pd + pos_34_pd + 
+           pos_35_pd + pos_36_pd + pos_37_pd + pos_38_pd + pos_39_pd,
+         time_after_tx = compute_cumsum(sum_tx_periods),
+         num_pd_w_tx = compute_cumsum(Intervention_Redefined),
+         num_pd_w_naloxone_yes = compute_cumsum(Naloxone_Pharmacy_Yes_Redefined),
+         num_pd_w_naloxone_no = compute_cumsum(Naloxone_Pharmacy_No_Redefined),
+         num_pd_w_med_marijuana = compute_cumsum(Medical_Marijuana_Redefined),
+         num_pd_w_rec_marijuana = compute_cumsum(Recreational_Marijuana_Redefined),
+         num_pd_w_gsl = compute_cumsum(GSL_Redefined),
+         num_pd_w_pdmp = compute_cumsum(PDMP_Redefined),
+         num_pd_w_medicaid = compute_cumsum(Medicaid_Expansion_Redefined),
+         lag_num_pd_w_tx = lag(num_pd_w_tx))
+
+sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_tx[is.na(sensitivity_anlys_event_study_data_lin_post_tx$lag_num_pd_w_tx)] <- 0
+  
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_linear_time<-lm(log(prop_dead)~ State +
+                                                      Time_Period_ID:Region  +
+                                                      I(Time_Period_ID^2):Region + 
+                                                      num_pd_w_naloxone_yes +
+                                                      num_pd_w_naloxone_no +
+                                                      num_pd_w_med_marijuana +
+                                                      num_pd_w_rec_marijuana +
+                                                      num_pd_w_gsl +
+                                                      num_pd_w_pdmp +
+                                                      num_pd_w_medicaid +
+                                                      Intervention_Redefined+
+                                                      lag_num_pd_w_tx,
+                                                    data = sensitivity_anlys_event_study_data_lin_post_tx)
+summary(sensitivity_anlys_lin_post_tx_model_linear_time)
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx <- model.matrix(sensitivity_anlys_lin_post_tx_model_linear_time)
+
+#estimate the 95% CI and SD
+coefficient_values_log_fixed_lin_time_lin_post_tx <- coef(sensitivity_anlys_lin_post_tx_model_linear_time)
+#type = "response" to get the estimated probabilities
+main_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx <- compute_sd_and_CI(full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx,
+                                                                log(sensitivity_anlys_event_study_data_lin_post_tx$prop_dead),
+                                             coefficient_values_log_fixed_lin_time_lin_post_tx,
+                                             p = ncol(full_df_w_basis_functions_log_fixed_lin_time_lin_post_tx) - 50)
+round(main_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx,4)
+```
+
+### Attributable Deaths
+```{r}
+date_data <- main_analysis_data[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_lin_time_lin_post_tx <- attr_death_compute(sensitivity_anlys_event_study_data_lin_post_tx,
+                                                   main_analysis_sd_and_ci_log_fixed_lin_time_lin_post_tx, 
+                                                   post_tx_model = FALSE, tx_name = "num_pd_w_tx")
+attr_deaths_est_log_lin_time_lin_post_tx <- merge(attr_deaths_est_log_lin_time_lin_post_tx, date_data, 
+                                                    by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_lin_time_lin_post_tx, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Attributable Deaths",
+       title = "Estimated Number of Attributable Deaths Using Linear and Quad. Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+## Event Study
+### Model Fitting
+```{r}
+#create a formula for the gam model which includes the state effects, smoothed time effects, policy measures, 
+#the periods before the intervention (excluding 1 period and 34 periods before intervention)
+#the intervention period, and the periods after the intervention
+
+formula_event_study_log_fixed_lin_time <- formula(paste("log(prop_dead) ~ State +
+                                           Time_Period_ID:Region  +
+                                           I(Time_Period_ID^2):Region + 
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)-2), 
+                                            function(x)paste("neg_", x, "_pd", sep = "")), collapse = "+"),
+                                     "+",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_event_study_model_log_fixed_lin_time<-lm(formula_event_study_log_fixed_lin_time,
+                                         data = sensitivity_anlys_event_study_data)
+
+summary(sensitivity_anlys_event_study_model_log_fixed_lin_time)
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_event_study_log_fixed_lin_time <-
+  model.matrix(sensitivity_anlys_event_study_model_log_fixed_lin_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_event_study_log_fixed_lin_time <- coef(sensitivity_anlys_event_study_model_log_fixed_lin_time)
+#type = "response" to get the estimated probabilities
+sensitivity_anlys_event_study_sd_and_ci_log_fixed_lin_time <- 
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_event_study_log_fixed_lin_time), 
+                                                             log(sensitivity_anlys_event_study_data$prop_dead),
+                                                             coefficient_values_sensitivity_anlys_event_study_log_fixed_lin_time,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_event_study_log_fixed_lin_time) - 50)
+(sensitivity_anlys_event_study_sd_and_ci_log_fixed_lin_time)
+# write.csv(round(sensitivity_anlys_event_study_sd_and_ci, 3), "./Data/event_study_coef_and_ci.csv")
+```
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_log_fixed_lin_time <- sensitivity_anlys_event_study_sd_and_ci_log_fixed_lin_time %>%
+  mutate(term = rownames(sensitivity_anlys_event_study_sd_and_ci_log_fixed_lin_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_log_fixed_lin_time) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_log_fixed_lin_time, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+
+## Event Study with Model SD
+### SD Estimator
+```{r}
+summary_model_log_fixed_lin_time <- summary(sensitivity_anlys_event_study_model_log_fixed_lin_time)
+
+coef_log_fixed_lin_time <- data.frame(coef_values = summary_model_log_fixed_lin_time$coefficients[,1],
+                                      lb_coef = summary_model_log_fixed_lin_time$coefficients[,1] -
+                                        1.96*summary_model_log_fixed_lin_time$coefficients[,2],
+                                      ub_coef = summary_model_log_fixed_lin_time$coefficients[,1] +
+                                        1.96*summary_model_log_fixed_lin_time$coefficients[,2])
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_event_study_log_fixed_lin_time_model_sd <- coef_log_fixed_lin_time %>%
+  mutate(term = rownames(coef_log_fixed_lin_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}), 
+                     sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")})))
+colnames(plot_event_study_log_fixed_lin_time_model_sd) <- c("term", "estimate", "conf.low", "conf.high")
+
+dwplot(plot_event_study_log_fixed_lin_time_model_sd, colour = "black",
+       vars_order =  c(sapply((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0, 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}),
+                       sapply(2:(max(merged_main_time_data_int$intervention_time_id, na.rm = TRUE) - 2), 
+                                   function(x){paste("neg_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "States Excluded", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_hline(yintercept = 33, col = "red", linetype = "dashed")
+  
+
+```
+
+
+## Analysis With Only Periods After Treatment
+```{r}
+formula_post_tx_log_fixed_lin_time <- formula(paste("log(prop_dead)~ State +
+                                           Time_Period_ID:Region  +
+                                           I(Time_Period_ID^2):Region + 
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model_log_fixed_lin_time<-lm(formula_post_tx_log_fixed_lin_time,
+                                         data = sensitivity_anlys_event_study_data)
+summary(sensitivity_anlys_post_tx_model_log_fixed_lin_time)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_lin_time <- model.matrix(sensitivity_anlys_post_tx_model_log_fixed_lin_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_fixed_lin_time <- coef(sensitivity_anlys_post_tx_model_log_fixed_lin_time)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time <-
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_lin_time), 
+                                                         log(sensitivity_anlys_event_study_data$prop_dead),
+                                                         coefficient_values_sensitivity_anlys_post_tx_log_fixed_lin_time,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_lin_time) - 50)
+sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_fixed_lin_time <- sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_fixed_lin_time) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_fixed_lin_time$num_states <- sapply(plot_post_tx_log_fixed_lin_time$term, function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_log_fixed_lin_time, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() 
+  # geom_vline(aes(xintercept = coef(main_analysis_model_log_fixed_lin_time)["Intervention_Redefined"]), 
+  #            linetype = "dashed", color = "red") 
+  # geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_fixed_lin_time)["Intervention_Redefined"]), y = 12, 
+  #           x = coef(main_analysis_model_log_fixed_lin_time)["Intervention_Redefined"] + 0.1), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+### Attributable Deaths
+```{r}
+date_data <- sensitivity_anlys_event_study_data[, c("Time_Period_ID", "Time_Period_Start")]
+date_data <- date_data[!duplicated(date_data),]
+attr_deaths_est_log_lin_time_diff_post_tx <- attr_death_compute(sensitivity_anlys_event_study_data,
+                                                   sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time, 
+                                                   post_tx_model = TRUE)
+attr_deaths_est_log_lin_time_diff_post_tx <- merge(attr_deaths_est_log_lin_time_diff_post_tx, date_data, 
+                                                    by.x = "Time_Period", by.y = "Time_Period_ID")
+
+ggplot(attr_deaths_est_log_lin_time_diff_post_tx, aes(x = Time_Period_Start)) + 
+  # geom_point(aes(y = attr_deaths)) + 
+  geom_line(aes(y = attr_deaths, linetype = "Estimate")) + 
+  # geom_point(aes(y = attr_deaths_lb)) + 
+  geom_line(aes(y = attr_deaths_lb, linetype = "95% CI")) + 
+  # geom_point(aes(y = attr_deaths_ub)) + 
+  geom_line(aes(y = attr_deaths_ub, linetype = "95% CI")) + 
+  labs(x = "Date", y = "Attributable Deaths",
+       title = "Estimated Number of Attributable Deaths Using Linear and Quad. Time Effects, 
+       Log Probability of Drug Overdose Death, Linear Policy Effects",
+       linetype = "") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) + 
+  scale_linetype_manual(values = c("dashed", "solid"))
+```
+
+
+
+
+## Analysis With Only Periods After Treatment with Model SD
+```{r}
+summary_model_log_fixed_lin_time_post_tx_model_sd <- summary(sensitivity_anlys_post_tx_model_log_fixed_lin_time)
+
+coef_log_fixed_lin_time_post_tx_model_sd <- data.frame(coef_values = summary_model_log_fixed_lin_time_post_tx_model_sd$coefficients[,1],
+                                      lb_coef = summary_model_log_fixed_lin_time_post_tx_model_sd$coefficients[,1] -
+                                        1.96*summary_model_log_fixed_lin_time_post_tx_model_sd$coefficients[,2],
+                                      ub_coef = summary_model_log_fixed_lin_time_post_tx_model_sd$coefficients[,1] +
+                                        1.96*summary_model_log_fixed_lin_time_post_tx_model_sd$coefficients[,2])
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_fixed_lin_time_model_sd <- coef_log_fixed_lin_time_post_tx_model_sd %>%
+  mutate(term = rownames(coef_log_fixed_lin_time_post_tx_model_sd)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_fixed_lin_time_model_sd) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_fixed_lin_time_model_sd$num_states <- sapply(plot_post_tx_log_fixed_lin_time_model_sd$term, function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+dwplot(plot_post_tx_log_fixed_lin_time_model_sd, colour = "black",
+       vars_order =  c(sapply(((max(merged_main_time_data_int$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)):0), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods") + 
+  scale_color_grey() + 
+  coord_flip() +
+  geom_vline(aes(xintercept = coef(main_analysis_model_log_fixed_lin_time)["Intervention_Redefined"]), 
+             linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste("Coefficient Estimate: ", coef(main_analysis_model_log_fixed_lin_time)["Intervention_Redefined"]), y = 12, 
+            x = coef(main_analysis_model_log_fixed_lin_time)["Intervention_Redefined"] + 0.1), color = "red")
+  # geom_text(aes(label = num_states, x = .1, y = 40:1), size = 2)
+  
+
+```
+
+## Analysis With Only Periods After Treatment Subset
+```{r}
+formula_post_tx_log_fixed_lin_time <- formula(paste("log(prop_dead)~ State +
+                                           Time_Period_ID:Region  +
+                                           I(Time_Period_ID^2):Region + 
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +",
+                                     paste(sapply(0:(29 - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)),
+                              function(x)paste("pos_", x, "_pd", sep = "")), collapse = "+")))
+#run the gam model
+sensitivity_anlys_post_tx_model_log_fixed_lin_time_subset<-lm(formula_post_tx_log_fixed_lin_time,
+                                         data = data_subset)
+summary(sensitivity_anlys_post_tx_model_log_fixed_lin_time_subset)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_lin_time_subset <-
+  model.matrix(sensitivity_anlys_post_tx_model_log_fixed_lin_time_subset)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_post_tx_log_fixed_lin_time_subset <- coef(sensitivity_anlys_post_tx_model_log_fixed_lin_time_subset)
+
+sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time_subset <-
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_lin_time_subset), 
+                                                         log(data_subset$prop_dead),
+                                                         coefficient_values_sensitivity_anlys_post_tx_log_fixed_lin_time_subset,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_post_tx_log_fixed_lin_time_subset) - 50)
+sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time_subset
+```
+
+### Plot Results
+```{r}
+#plot the coefficients for the periods before and after the intervention with 95% CI
+plot_post_tx_log_fixed_lin_time_subset <- sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time_subset %>%
+  mutate(term = rownames(sensitivity_anlys_post_tx_sd_and_ci_log_fixed_lin_time_subset)) %>%
+  dplyr::select(term, coef_values, lb_coef, ub_coef) %>%
+  filter(term %in% c(sapply(0:(max(data_subset$Time_Period_ID) - 
+                              min(merged_main_time_data_int$intervention_time_id, na.rm = TRUE)), 
+                                   function(x){paste("pos_", x, "_pd", sep = "")}))) 
+colnames(plot_post_tx_log_fixed_lin_time_subset) <- c("term", "estimate", "conf.low", "conf.high")
+plot_post_tx_log_fixed_lin_time_subset$num_states_subset <- sapply(plot_post_tx_log_fixed_lin_time_subset$term, function(x){sum(sensitivity_anlys_event_study_data[,x])})
+
+plot_post_tx_data_lin_time <- merge(plot_post_tx_log_fixed_lin_time, plot_post_tx_log_fixed_lin_time_subset, 
+                           by = "term", all.x = TRUE)
+plot_post_tx_data_lin_time$term <- factor(plot_post_tx_data_lin_time$term, 
+                                                     levels = sapply(0:39, function(x){paste("pos_", x, "_pd", sep = "")}))
+ggplot(plot_post_tx_data_lin_time, aes(x = term)) +  
+  geom_point(plot_post_tx_data_lin_time, mapping = aes(y = estimate.y, color = "subset data")) + 
+  geom_pointrange(plot_post_tx_data_lin_time, 
+                  mapping = aes(x = term, y = estimate.y, ymin = conf.low.y, ymax = conf.high.y, color = "subset data"),
+                  fatten = 1, alpha = .5) + 
+  geom_point(plot_post_tx_data_lin_time, mapping = aes(y = estimate.x, color = "full data")) + 
+  geom_pointrange(plot_post_tx_data_lin_time, 
+                  mapping = aes(x = term, y = estimate.x, ymin = conf.low.x, ymax = conf.high.x, color = "full data"),
+                  fatten = 1, alpha = .5) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        axis.text.x = element_text(angle = 45, size = 4),
+        legend.position = "bottom") +
+  geom_hline(aes(yintercept = 0), linetype = "dashed") +
+  labs(y = "Time Periods", x = "Coefficients and 95% Confidence Intervals", 
+       title = "Coefficient of Pre-Intervention and Post-Intervention Periods",
+       color = "Full Data or Subset Times") 
+
+  
+
+```
+
+
+
+
+## Analysis With Only Periods After Treatment
+```{r}
+
+#run the gam model
+sensitivity_anlys_lin_post_tx_model_log_fixed_lin_time<-lm(log(prop_dead)~ State +
+                                           Time_Period_ID:Region  +
+                                           I(Time_Period_ID^2):Region + 
+                                           Naloxone_Pharmacy_Yes_Redefined +
+                                           Naloxone_Pharmacy_No_Redefined +
+                                           Medical_Marijuana_Redefined +
+                                           Recreational_Marijuana_Redefined +
+                                           GSL_Redefined +
+                                           PDMP_Redefined +
+                                           Medicaid_Expansion_Redefined +
+                                             time_after_tx,
+                                         data = sensitivity_anlys_event_study_data_lin_post_tx)
+summary(sensitivity_anlys_lin_post_tx_model_log_fixed_lin_time)
+
+
+
+```
+
+### Sandwich Estimator
+```{r}
+#compute the full dataset including basis functions
+full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_fixed_lin_time <-
+  model.matrix(sensitivity_anlys_lin_post_tx_model_log_fixed_lin_time)
+
+#estimate the 95% CI and SD
+coefficient_values_sensitivity_anlys_lin_post_tx_log_fixed_lin_time <- coef(sensitivity_anlys_lin_post_tx_model_log_fixed_lin_time)
+
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_fixed_lin_time <-
+  compute_sd_and_CI((full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_fixed_lin_time), 
+                                                         log(sensitivity_anlys_event_study_data$prop_dead),
+                                                         coefficient_values_sensitivity_anlys_lin_post_tx_log_fixed_lin_time,
+                    p = ncol(full_df_w_basis_functions_sensitivity_anlys_lin_post_tx_log_fixed_lin_time) - 50)
+sensitivity_anlys_lin_post_tx_sd_and_ci_log_fixed_lin_time
+```
+

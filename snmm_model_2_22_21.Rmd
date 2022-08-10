@@ -1,0 +1,912 @@
+---
+title: "Coarse SNNM: DIH Prosecutions"
+author: "Kelly Kung"
+date: "3/30/2022"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(echo = TRUE, root.dir = "~/OneDrive - Boston University/Research-Lok")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# Set Up
+## R Code 
+```{r}
+#packages we need for this code file
+library(ggplot2)
+library(mgcv)
+library(lubridate)
+library(zoo)
+library(tidyverse)
+library(dplyr)
+library(aod)
+library("plot3D")
+``` 
+
+## Data 
+```{r}
+#read in data
+main_analysis_data<-read.csv("./Data/full_data_set_11_29_21_unintentional.csv")
+
+################################## set up data set ################################
+#add the intervention dates and time period data
+main_analysis_data$Intervention_First_Date<-as.Date(main_analysis_data$Intervention_First_Date)
+main_analysis_data$Time_Period_Start<-as.Date(main_analysis_data$Time_Period_Start)
+names(main_analysis_data)[which(colnames(main_analysis_data) == "sum_deaths")] <- "imputed_deaths"
+main_analysis_data$dih_exposure <- as.numeric(main_analysis_data$Intervention_Redefined > 0)
+#compute the risk of overdose death
+main_analysis_data$prop_dead <- main_analysis_data$imputed_deaths/main_analysis_data$population
+
+```
+
+# Model for Treatment Effect
+## Create Dataset
+```{r}
+
+#create sum of policies already enacted for treatment initiation
+#create a new dataset dih_dataset for which we can make changes to
+dih_dataset <- main_analysis_data
+#we first create lag variables for the policies so that we know that by time t, whether the policy has been enacted
+#note that we don't count what happened at time t
+dih_dataset <- dih_dataset %>%
+  #make sure that the data is ordered according to first state and then time period
+  arrange(State, Time_Period_ID) %>%
+  #group by state so that when we lag, we only lag within the state
+  group_by(State) %>%
+  mutate(lag_tx = lag(dih_exposure),
+         lag_naloxone_pharm_yes = lag(Naloxone_Pharmacy_Yes_Redefined),
+         lag_naloxone_pharm_no = lag(Naloxone_Pharmacy_No_Redefined),
+         lag_medical_marijuana = lag(Medical_Marijuana_Redefined),
+         lag_rec_marijuana = lag(Recreational_Marijuana_Redefined),
+         lag_gsl = lag(GSL_Redefined),
+         lag_pdmp = lag(PDMP_Redefined),
+         lag_medicaid = lag(Medicaid_Expansion_Redefined),
+         lag_intervention = lag(Intervention_Redefined)) 
+
+#since we lag the variables, the entry at time 1 will be NA. Since we have start dates of the different policies, I checked to 
+#see which policies were enacted before Jan 1, 2000.
+#if the policies were enacted before Jan 1, 2000, I impute a 1 for the first time period, otherwise a 0
+dih_dataset$lag_tx[dih_dataset$Time_Period_ID == 1] <- 
+  dih_dataset$lag_naloxone_pharm_yes[dih_dataset$Time_Period_ID == 1] <- 
+  dih_dataset$lag_naloxone_pharm_no[dih_dataset$Time_Period_ID == 1] <-
+  dih_dataset$lag_rec_marijuana[dih_dataset$Time_Period_ID == 1] <-
+  dih_dataset$lag_gsl[dih_dataset$Time_Period_ID == 1] <-
+  dih_dataset$lag_medicaid[dih_dataset$Time_Period_ID == 1] <- 
+  dih_dataset$lag_intervention[dih_dataset$Time_Period_ID == 1]<-0
+
+dih_dataset$lag_medical_marijuana[dih_dataset$Time_Period_ID == 1 &
+                                   dih_dataset$State %in% 
+                                   c("Alaska", "California", "Maine", "Oregon", "Washington")] <- 1
+dih_dataset$lag_medical_marijuana[dih_dataset$Time_Period_ID == 1  &
+                                   !(dih_dataset$State %in% 
+                                       c("Alaska", "California", "Maine", "Oregon", "Washington"))] <- 0
+
+dih_dataset$lag_pdmp[dih_dataset$Time_Period_ID == 1  &
+                                   dih_dataset$State %in% 
+                      c("California", "Hawaii", "Idaho", "Illinois", "Indiana", 
+                        "Kentucky", "Massachusetts", "Michigan", "Nevada",
+                        "New York", "Oklahoma", "Pennsylvania", "Rhode Island",
+                        "Texas", "Utah", "West Virginia")] <- 1
+dih_dataset$lag_pdmp[dih_dataset$Time_Period_ID == 1  &
+                                   !(dih_dataset$State %in% 
+                                       c("California", "Hawaii", "Idaho", "Illinois", "Indiana", 
+                                         "Kentucky", "Massachusetts", "Michigan", "Nevada",
+                                         "New York", "Oklahoma", "Pennsylvania", "Rhode Island",
+                                         "Texas", "Utah", "West Virginia"))] <- 0
+
+#create a new variable that indicates the number of policies that have been enacted by time t
+dih_dataset$sum_lag_policies <- dih_dataset$lag_naloxone_pharm_yes + 
+  dih_dataset$lag_naloxone_pharm_no + 
+  dih_dataset$lag_medical_marijuana + 
+  dih_dataset$lag_rec_marijuana + 
+  dih_dataset$lag_gsl + 
+  dih_dataset$lag_pdmp + 
+  dih_dataset$lag_medicaid
+
+#impute Hawaii's treatment date as something far off in the future
+dih_dataset$Intervention_First_Date[dih_dataset$State == "Hawaii"] <- as.Date("9999-01-01")
+
+```
+
+# One Parameter Model: Binary Treatment Variable
+## Mimicking Potential Outcomes
+To compute the mimicked potential outcome: $H_{s,k}(t)$ for $k \in \{7-2019, \dotsc, 7-2000 \}$ and $t < k$, we first extract $Y_{s,k}$. We then compute $\gamma_t^k = exp(\psi*(a_{s,t} - a_{s,t-1}))$. Let $t_s^*$ be the treatment time interval for state $s$. We focus on data points for which $t \leq t_s^*$ and $t<k$. This is because for the treatment initiation model, we include data points for which $t \leq t_s^*$ and we want $t<k$. We let $a_{s,t}$ be a binary variable. For these data points we are intersted in, we create the variable `hkt` which is equal to $\frac{Y_{s,k}}{exp(\psi)}$ when $k > t_s^*$ (i.e. $Y_{s,k}$ is a treated outcome) and equal to $Y_{s,k}$ when $k \leq t_s^*$ (i.e. $Y_{s,k}$ is an untreated outcome). Lastly, we combine all these datapoints together for each $k$ into a dataset to be returned to use in the treatment initiation model.
+
+```{r}
+
+compute_mimick_potential_outcome <- function(dataFrame, gamma_k_t){
+  #new_df is the dataset we will return, with the new rows appended
+  #we initialize it first as the input dataset df
+  new_data_frame <- data.frame()
+  
+  #here, k is the time in which we observe the outcome and t is the time of the treatments
+  #so we have k > t
+  for(k in max(unique(dataFrame$Time_Period_ID)):2){
+    #we first pull out the risk of OD at time k, so Y_k
+    outcome_k_data <- dataFrame %>%
+      arrange(State) %>%
+      filter(Time_Period_ID == k) %>%
+      dplyr::select(State, prop_dead, Intervention_First_Date, Time_Period_Start)
+    
+    #pull the treatment time period for the first treatment date
+    tx_time_period_data <- dataFrame %>%
+      filter(Time_Period_Start == floor_date(Intervention_First_Date, "6 months")) %>%
+      select(State, Time_Period_ID)
+    
+    #rename the Time_Period_ID
+    colnames(tx_time_period_data) <- c("State", "t_s")
+    
+    
+    #merge it with outcome_k_data
+    #note: we have all.x = TRUE because we want all the rows in outcome_k_data since the date
+    #for Hawaii is set to year 9999, so there are no matches
+    outcome_k_data_with_tx_time_period <- merge(outcome_k_data, tx_time_period_data, by = "State",
+                                                all.x = TRUE)
+    
+    #set t_s for Hawaii to be 9999
+    outcome_k_data_with_tx_time_period$t_s[outcome_k_data_with_tx_time_period$State == "Hawaii"] <- 9999
+    
+    #compute k - t_s^*
+    outcome_k_data_with_tx_time_period$k_minus_t_s <- k - outcome_k_data_with_tx_time_period$t_s
+    
+    
+    #compute H_k(t) given gamma_k_t:
+    #here, let t^* = treatment time 
+    #if k <= t^*, then H_k(t) = Y_k since we havent treated yet, so doesn't affect
+    #if t^* < t < k, then H_k(t) = Y_k since a_{t} - a_{t-1} = 0
+    #if t <= t^* < k, then H_k(t) = Y_k/gamma_k_t
+    outcome_k_data_with_tx_time_period$hkt <- ifelse(outcome_k_data_with_tx_time_period$k_minus_t_s > 0,
+                                                     outcome_k_data_with_tx_time_period$prop_dead/gamma_k_t, 
+                                                     outcome_k_data_with_tx_time_period$prop_dead)
+    
+    # outcome_k_data <- dataFrame %>%
+    #   +       arrange(State) %>%
+    #   +       filter(Time_Period_ID == k) %>%
+    #   +       dplyr::select(State, prop_dead, Intervention_First_Date, Time_Period_Start)
+    # +     
+    #   +     #compute H_k(t) given gamma_k_t:
+    #   +     #here, let t^* = treatment time 
+    #   +     #if k <= t^*, then H_k(t) = Y_k since we havent treated yet, so doesn't affect
+    #   +     #if t^* < t < k, then H_k(t) = Y_k since a_{t} - a_{t-1} = 0
+    #   +     #if t <= t^* < k, then H_k(t) = Y_k/gamma_k_t
+    #   +     outcome_k_data$hkt <- ifelse(outcome_k_data$Time_Period_Start > outcome_k_data$Intervention_First_Date,
+    #                                      +                                  outcome_k_data$prop_dead/gamma_k_t, outcome_k_data$prop_dead)
+    
+    
+    #filter the data for which A_{s,t} = 0 and the time interval that contains the treatment time since we only need these data 
+    #to predict treatment initiation for the model
+    #we also filter so that the t < k
+    untreated_and_first_tx_date_data <- dataFrame %>%
+      arrange(State, Time_Period_ID) %>%
+      #filter for t <= t^* because we use these time periods to predict treatment initiation
+      filter(Time_Period_Start <= Intervention_First_Date,
+             #filter for t < k
+             Time_Period_ID < k)
+    
+    #merge the filtered dataset with the outcome_k_data_with_tx_time_period which contains the computed H_k(t)
+    untreated_and_first_tx_date_data <- merge(untreated_and_first_tx_date_data, 
+                                              outcome_k_data_with_tx_time_period[,c("State", "hkt", "t_s",
+                                                                                    "k_minus_t_s")], by = "State")
+    
+    #compute values that may be useful
+    #add k and t to the dataset and the date of k
+    untreated_and_first_tx_date_data$k <- k
+    untreated_and_first_tx_date_data$date_k <- unique(outcome_k_data_with_tx_time_period$Time_Period_Start)
+    untreated_and_first_tx_date_data$t <- untreated_and_first_tx_date_data$Time_Period_ID
+    
+    
+    #compute k - t
+    untreated_and_first_tx_date_data$k_minus_t <- k - untreated_and_first_tx_date_data$t
+    #compute indicator of whether Y_{s,k} is treated outcome
+    untreated_and_first_tx_date_data$treated_outcome_indicator <- untreated_and_first_tx_date_data$date_k > 
+      untreated_and_first_tx_date_data$Intervention_First_Date
+    
+    #we then append the rows to the new_data_frame
+    new_data_frame <- rbind(new_data_frame, untreated_and_first_tx_date_data)
+  }
+  new_data_frame
+}
+
+
+
+```
+
+## Finding $\psi$: $\gamma_t^k = exp(\psi (a_t - a_{t-1}))$
+Here, we assume that the treatment effects model is given by the one parameter model:
+$$\gamma_t^k = exp(\psi*(a_t - a_{t-1})),$$
+where $a_t$ and $a_{t-1}$ are binary variables (for now) indicating whether there have ever been any DIH prosecution media alerts by time $t$ and $t-1$. Further, we have $k > t_s^*$.
+
+We fit a treatment initiation model for the response `dih_exposure` which is a binary variable indicating whether the state was exposed to DIH prosecution in the media, where we use the following as predictors:
+
+* `sum_lag_policies` is the number of other policy measures that have been enacted from time 1 until time $t-1$
+* `hkt` is the computed $H_k(t)$
+* `Time_Period_ID` is the linear time effect.
+
+Recall that the `analysis_data_with_hkt` only contains the datapoints for which $t \leq t^*$.
+For each value $\psi$, we extract the coefficient of `hkt` from the treatment initiation model, and we find the $\psi$ that leads to a coefficient of zero. 
+We also store a vector of `confidence_interval` which stores the values of $\psi$ if the Wald test for the coefficient of `hkt` is not statistically significant at the $alpha = 0.05$ level.
+
+```{r}
+#create a vector of 100 psi
+# psi_grid_params <- seq(-0.1012847, -0.1012846, length.out = 100)
+psi_grid_params <- seq(-.2, .1, by = 0.001)
+
+#initialize the vector of coefficients for H(t) in treatment initiation model
+coef_hkt <- rep(NA, length(psi_grid_params))
+confidence_interval <- c()
+for(grid_point in 1:length(psi_grid_params)){
+  #statement to print the status of the for loop
+  # if(grid_point%%10 == 0){print(grid_point)}
+  #compute gamma_k_t given the psi_grid_params[grid_point]. Since here, the treatment is binary, we only need the value for
+  #exp(psi_grid_params[grid_point])
+  gamma_k_t <- exp(psi_grid_params[grid_point])
+
+  #compute H(t) given the dataset and gamma_k_t
+  analysis_data_with_hkt <- compute_mimick_potential_outcome(dih_dataset, gamma_k_t)
+ 
+  #fit model for treatment initiation
+  treatment_initiation_model <- glm(dih_exposure~ 
+                       sum_lag_policies + 
+                       hkt + 
+                       Time_Period_ID,
+                     data = analysis_data_with_hkt, family = "binomial")
+  
+  #store the coefficient for H_k(t)
+  coef_hkt[grid_point] <- coef(treatment_initiation_model)["hkt"]
+  
+  #conduct the Wald Test for the third coefficient, which is H_k(t) here since the first coefficient is the intercept
+  wald_test_results <- wald.test(vcov(treatment_initiation_model), coef(treatment_initiation_model), 3)
+  #we then store the p-value and store the psi values if the p-value > 0.05
+  pval <- wald_test_results$result$chi2["P"]
+  if(pval > 0.05){
+    confidence_interval <- rbind(confidence_interval, psi_grid_params[grid_point])
+  }
+}
+
+coef_hkt[179:180]
+psi_grid_params[179:180]
+as.vector(confidence_interval)
+#-0.022
+#(-0.140, 0.083)
+```
+
+The $\psi$ that produced an $\alpha(\psi)$, where $\alpha(\psi)$ is the coefficient of $H_k(t)$ in the treatment initiation model, that is closest to 0 is -0.022. The 95% Confidence Interval is (-0.140, 0.083).
+
+## Checking Grid-Search
+### With Original Dataset
+Since we can compute the $\psi$ in a one-parameter model from the unbiased estimating equation, we do so to check the grid-search value.
+We showed that 
+$$E\left(\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} \vec{q}{_t}^{k}(\bar{X}_{s,t}, \bar{A}_{s,t-1}) H_{s,k}(t) \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}({g(A}_{s,t}) - \lambda_{s,t})\right) = 0.$$
+We let $\vec{q}{_t}^{k}(\bar{X}_{s,t}, \bar{A}_{s,t-1}) = 1$ and $H_{s,k}(t) = \frac{Y_{s,k}}{exp(\psi)} \mathbb{I}\{k > t_s^*\} + Y_{s,k} \mathbb{I}\{k \leq t_s^*\}$ where $t_s^*$ is the treatment time for state $s$. Furthermore, we let $g(A_{s,t}) = \mathbb{I}\{A_{s,t} > 0\}$ and $\lambda_{s,t} = p_{s,t}$, the probability of treatment.
+Then, we have the following:
+\begin{align*}
+  0 &= \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  \left(\frac{Y_{s,k}}{exp(\psi)} \mathbb{I}\{k > t_s^*\} + Y_{s,k} \mathbb{I}\{k \leq t_s^*\}\right) \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &= \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k}exp(-\psi) \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &+ \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &\Rightarrow exp(-\psi) \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k} \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) = -\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &\Rightarrow exp(-\psi) = -\frac{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})}{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k} \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})} \\
+  &\Rightarrow \psi = - log\left(-\frac{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})}{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k} \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})}\right),
+\end{align*}
+
+where we model $p_{s,t}$ using the `sum_lag_policies` and `Time_Period_ID` for data points in which $\bar{A}_{s,t-1} = \bar{0}$.
+However, if the fraction is positive, then we arrive at an issue since we cannot take the log of a negative.
+
+```{r}
+#filter the data to fit the treatment initiation model
+dih_dataset_with_past_treatment_equals_0 <- dih_dataset %>%
+  # filter data so that t < t_s^* + 1
+  filter(Intervention_Redefined < 1)
+
+#fit the treatment initiation model
+treatment_initiation_model <- glm(dih_exposure~
+                                    sum_lag_policies + 
+                                    Time_Period_ID,
+                                  data = dih_dataset_with_past_treatment_equals_0,
+                                  family = "binomial")
+
+#compute the p_{s,t} and add it into the dih_dataset_with_past_treatment_equals_0
+prob_tx <- fitted(treatment_initiation_model)
+dih_dataset_with_past_treatment_equals_0$prob_tx <- prob_tx
+
+#compute Y_{s,k} where periods k = 1, ..., T+1 for t = 0, ..., k-1
+#to do this, we can use the compute_mimick_potential_outcome() function with gamma_k_t_when_treated as 1
+#we also compute an indicator of whether k > t_s^* to indicate whether it is a treated outcome or untreated outcome
+data_with_observed_Ysk <- compute_mimick_potential_outcome(dih_dataset, gamma_k_t = 1)
+
+#merge the data with Y_{s,k} and the data with the probability of treatment
+observed_Ysk_and_pst <- merge(data_with_observed_Ysk, 
+                          dih_dataset_with_past_treatment_equals_0[,c("Time_Period_ID", "State", "prob_tx")],
+                          by = c("Time_Period_ID", "State"))
+
+#untreated outcome data to be used for numerator
+untreated_outcome_data <- observed_Ysk_and_pst[observed_Ysk_and_pst$treated_outcome_indicator == FALSE,]
+numerator <- sum(untreated_outcome_data$hkt*(untreated_outcome_data$dih_exposure - untreated_outcome_data$prob_tx))
+
+#treated outcome data to be used for denominator
+treated_outcome_data <- observed_Ysk_and_pst[observed_Ysk_and_pst$treated_outcome_indicator == TRUE,]
+denominator <- sum(treated_outcome_data$hkt*(treated_outcome_data$dih_exposure - treated_outcome_data$prob_tx))
+
+-log(-numerator/denominator)
+```
+
+### With Stacked Dataset
+```{r}
+#compute Y_{s,k} where periods k = 1, ..., T+1 for t =0, ..., k-1
+#to do this, we can use the compute_mimick_potential_outcome() function with gamma_k_t_when_treated as 1
+#we also compute an indicator of whether k > t_s^* to indicate whether it is a treated outcome or untreated outcome
+stacked_data_with_observed_Ysk <- compute_mimick_potential_outcome(dih_dataset, gamma_k_t = 1)
+
+treatment_initiation_model_stacked_data <- glm(dih_exposure~
+                                    sum_lag_policies + 
+                                    Time_Period_ID,
+                                  data = data_with_observed_Ysk,
+                                  family = "binomial")
+#store the p_{s,t}
+stacked_data_with_observed_Ysk$prob_tx <- fitted(treatment_initiation_model_stacked_data)
+
+#untreated outcome data to be used for numerator
+untreated_outcome_stacked_data <- stacked_data_with_observed_Ysk[stacked_data_with_observed_Ysk$treated_outcome_indicator == FALSE,]
+numerator_stacked <- sum(untreated_outcome_stacked_data$hkt*(untreated_outcome_stacked_data$dih_exposure - 
+                                                       untreated_outcome_stacked_data$prob_tx))
+
+#treated outcome data to be used for denominator
+treated_outcome_stacked_data <- stacked_data_with_observed_Ysk[stacked_data_with_observed_Ysk$treated_outcome_indicator == TRUE,]
+denominator_stacked <- sum(treated_outcome_stacked_data$hkt*(treated_outcome_stacked_data$dih_exposure - 
+                                                       treated_outcome_stacked_data$prob_tx))
+
+-log(-numerator_stacked/denominator_stacked)
+
+```
+
+# Two Parameter Model: Binary Treatment
+## Mimicking Potential Outcomes
+To compute the mimicked potential outcome: $H_{s,k}(t)$ for $k \in \{7-2019, \dotsc, 7-2000 \}$ and $t < k$, we first extract $Y_{s,k}$. We then compute $\gamma_t^k = exp(\psi_1*(a_t - a_{t-1}) + \psi_2*(a_t - a_{t-1})*(k-t_s^*))$. Let $t_s^*$ be the treatment time interval for state $s$. We focus on data points for which $t \leq t_s^*$ and $t<k$. This is because for the treatment initiation model, we include data points for which $t \leq t_s^*$ and we want $t<k$. We let $a_{s,t}$ be a binary variable. For these data points we are interested in, we create the variable `hkt` which is equal to $\frac{Y_{s,k}}{exp(\psi_1 + \psi_2(k-t_s^*))}$ when $k > t_s^*$ (i.e. $Y_{s,k}$ is a treated outcome) and equal to $Y_{s,k}$ when $k \leq t_s^*$ (i.e. $Y_{s,k}$ is an untreated outcome). Lastly, we combine all these datapoints together for each $k$ into a dataset to be returned to use in the treatment initiation model.
+
+```{r}
+
+compute_mimick_potential_outcome_two_parameter_model <- function(dataFrame, psi_1, psi_2){
+  #new_df is the dataset we will return, with the new rows appended
+  #we initialize it first as the input dataset df
+  new_data_frame <- data.frame()
+  
+  #here, k is the time in which we observe the outcome and t is the time of the treatments
+  #so we have k > t
+  for(k in max(unique(dataFrame$Time_Period_ID)):2){
+    #we first pull out the risk of OD at time k, so Y_k
+    outcome_k_data <- dataFrame %>%
+      arrange(State) %>%
+      filter(Time_Period_ID == k) %>%
+      dplyr::select(State, prop_dead, Intervention_First_Date, Time_Period_Start)
+    
+    #pull the treatment time period for the first treatment date
+    tx_time_period_data <- dataFrame %>%
+      filter(Time_Period_Start == floor_date(Intervention_First_Date, "6 months")) %>%
+      select(State, Time_Period_ID)
+    
+    #rename the Time_Period_ID
+    colnames(tx_time_period_data) <- c("State", "t_s")
+    
+    #merge it with outcome_k_data
+    #note: we have all.x = TRUE because we want all the rows in outcome_k_data since the date
+    #for Hawaii is set to year 9999, so there are no matches
+    outcome_k_data_with_tx_time_period <- merge(outcome_k_data, tx_time_period_data, by = "State",
+                                                all.x = TRUE)
+    
+    #set t_s for Hawaii to be 9999
+    outcome_k_data_with_tx_time_period$t_s[outcome_k_data_with_tx_time_period$State == "Hawaii"] <- 9999
+    
+    #compute k - t_s^*
+    outcome_k_data_with_tx_time_period$k_minus_t_s <- k - outcome_k_data_with_tx_time_period$t_s
+    
+    #compute H_k(t) given psi_1 and psi_2:
+    #here, let t^* = treatment time 
+    #if k <= t^*, then H_k(t) = Y_k since we havent treated yet, so doesn't affect
+    #if t^* < t < k, then H_k(t) = Y_k since a_{t} - a_{t-1} = 0
+    #if t <= t^* < k, then H_k(t) = Y_k/exp(psi_1 + psi_2*(k-t_s^*))
+    outcome_k_data_with_tx_time_period$hkt <- ifelse(outcome_k_data_with_tx_time_period$k_minus_t_s > 0,
+                                 outcome_k_data_with_tx_time_period$prop_dead/
+                                   (exp(psi_1 + psi_2*(outcome_k_data_with_tx_time_period$k_minus_t_s))), 
+                                 outcome_k_data_with_tx_time_period$prop_dead)
+    
+
+    
+    #filter the data for which A_{s,t} = 0 and the time interval that contains the treatment time since we only need these data 
+    #to predict treatment initiation for the model
+    #we also filter so that the t < k
+    untreated_and_first_tx_date_data <- dataFrame %>%
+      arrange(State, Time_Period_ID) %>%
+      #filter for t <= t^* because we use these time periods to predict treatment initiation
+      filter(Time_Period_Start <= Intervention_First_Date,
+             #filter for t < k
+             Time_Period_ID < k)
+    
+    #merge the filtered dataset with the outcome_k_data which contains the computed H_k(t)
+    untreated_and_first_tx_date_data <- merge(untreated_and_first_tx_date_data, 
+                                              outcome_k_data_with_tx_time_period[,c("State", "hkt", "k_minus_t_s",
+                                                                                 "t_s")], by = "State")
+    
+    #store k and t
+    untreated_and_first_tx_date_data$k <- k
+    untreated_and_first_tx_date_data$t <- untreated_and_first_tx_date_data$Time_Period_ID
+    untreated_and_first_tx_date_data$date_k <- unique(outcome_k_data$Time_Period_Start)
+    
+    #compute k - t
+    untreated_and_first_tx_date_data$k_minus_t <- untreated_and_first_tx_date_data$k - untreated_and_first_tx_date_data$t
+    
+    #we then append the rows to the new_data_frame
+    new_data_frame <- rbind(new_data_frame, untreated_and_first_tx_date_data)
+  }
+  new_data_frame
+}
+
+
+
+```
+
+
+## Finding $\psi = (\psi_1, \psi_2)$: $\gamma_t^k = exp(\psi_1 (a_t - a_{t-1}) + \psi_2(a_t - a_{t-1})(k - t_s^*))$
+Here, we assume that the treatment effects model is given by the two parameter model:
+$$\gamma_t^k = exp(\psi_1*(a_t - a_{t-1}) + \psi_2 *(a_t - a_{t-1})*(k-t_s^*)),$$
+where $a_t$ and $a_{t-1}$ are binary variables (for now) indicating whether there have ever been any DIH prosecution media alerts by time $t$ and $t-1$ and $k - t_s^*$ indicates the length of treatment. Further, we have $k > t_s^*$.
+
+We fit a treatment initiation model for the response `dih_exposure` which is a binary variable indicating whether the state was exposed to DIH prosecution in the media, where we use the following as predictors:
+
+* `sum_lag_policies` is the number of other policy measures that have been enacted from time 1 until time $t-1$
+* `hkt` is the computed $H_k(t)$
+* `hkt*sum_lag_policies` is the interaction between the $H_k(t)$ and the number of policy measures that have been enacted from time 1 until time $t-1$
+* `Time_Period_ID` is the linear time effect.
+
+Recall that the `analysis_data_with_hkt` only contains the datapoints for which $t \leq t^*$.
+For each value $\psi$, we extract the coefficient of `hkt` from the treatment initiation model, and we find the $\psi$ that leads to a coefficient of zero. 
+We also store a vector of `confidence_interval` which stores the values of $\psi$ if the Wald test for the coefficient of `hkt` and `hkt*sum_lag_policies` are not statistically significant at the $alpha = 0.05$ level.
+
+In the two-paramter model, we can't solve for both $psi_1$ and $psi_2$. However, we can solve for $psi_1$ as a function of $psi_2$.
+We showed that:
+$$E\left(\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} \vec{q}{_t}^{k}(\bar{X}_{s,t}, \bar{A}_{s,t-1}) H_{s,k}(t) \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}({g(A}_{s,t}) - \lambda_{s,t})\right) = 0.$$
+We let $\vec{q}{_t}^{k}(\bar{X}_{s,t}, \bar{A}_{s,t-1}) = 1$ and $H_{s,k}(t) = \frac{Y_{s,k}}{exp(\psi_1 + \psi_2*(k - t_s^*))} \mathbb{I}\{k > t_s^*\} + Y_{s,k} \mathbb{I}\{k \leq t_s^*\}$ where $t_s^*$ is the treatment time for state $s$. Furthermore, we let $g(A_{s,t}) = \mathbb{I}\{A_{s,t} > 0\}$ and $\lambda_{s,t} = p_{s,t}$, the probability of treatment.
+Then, we have the following:
+\begin{align*}
+  0 &= \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  \left(\frac{Y_{s,k}}{exp(\psi_1 + \psi_2*(k - t_s^*))} \mathbb{I}\{k > t_s^*\} + Y_{s,k} \mathbb{I}\{k \leq t_s^*\}\right) \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &= \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k}exp(-\psi_1 - \psi_2*(k - t_s^*)) \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &+ \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &\Rightarrow exp(-\psi_1) \sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k}exp(-\psi_2*(k - t_s^*)) \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) = -\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t}) \\
+  &\Rightarrow exp(-\psi_1) = -\frac{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k}exp(-\psi_2*(k - t_s^*)) \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})}{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k} \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})} \\
+  &\Rightarrow \psi_1 = - log\left(-\frac{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1} Y_{s,k} exp(-\psi_2*(k - t_s^*)) \mathbb{I}\{k \leq t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})}{\sum_s \sum_{k=1}^{T + 1} \sum_{t = 0}^{k-1}  Y_{s,k} \mathbb{I}\{k > t_s^*\} \mathbb{I}\{\bar{A}_{s,t-1} = \bar{0}\}(\mathbb{I}\{A_{s,t} > 0\} - p_{s,t})}\right),
+\end{align*}
+
+Hence, we first fit a logistic regression model to predict $p_{s,t}$. Then, we use grid search to find a value a $\psi_2$ (and therefore, a value for $\psi_1$) such that the coefficients of `hkt` and `hkt:sum_lag_policies` are both zero.
+
+```{r}
+#solving for psi_1 from unbiased estimating equations, we can write psi_1 as a function of psi_2
+compute_psi_1 <- function(psi_2, untreated_data, treated_data){
+  #compute psi_1
+  numerator <- sum(untreated_data$hkt*(untreated_data$dih_exposure - untreated_data$prob_tx))
+  denominator <- sum(treated_data$hkt*exp(-psi_2*treated_data$k_minus_t_s)*(treated_data$dih_exposure - treated_data$prob_tx))
+  
+  psi_1 <- -log(-numerator/denominator)
+  return(psi_1)
+  
+}
+
+
+#create a vector of 100 psi
+# psi_grid_params_two_param <- expand.grid(seq(-5, 5, by = 1), seq(-.08, 0, by = .005))
+# psi_grid_params_two_param <- expand.grid(seq(-1, -.8, by = .05), seq(0.026, .028, by = .0001))
+# #initialize the vector of coefficients for H(t) in treatment initiation model
+# coef_hkt <- rep(NA, nrow(psi_grid_params_two_param))
+# coef_hkt_sum_policy <- rep(NA, nrow(psi_grid_params_two_param))
+# confidence_interval <- c()
+# for(grid_point in 1:nrow(psi_grid_params_two_param)){
+#   #statement to print the status of the for loop
+#   if(grid_point%%10 == 0){print(grid_point)}
+#   
+#   #compute H(t) given the dataset and gamma_k_t_when_treated
+#   analysis_data_with_hkt <- compute_mimick_potential_outcome_two_parameter_model(dih_dataset, psi_grid_params_two_param[grid_point, 1], 
+#                                                  psi_grid_params_two_param[grid_point, 2])
+#  
+#   #fit model for treatment initiation
+#   treatment_initiation_model <- glm(dih_exposure~ 
+#                        sum_lag_policies + 
+#                        hkt + 
+#                        Time_Period_ID + 
+#                        hkt*sum_lag_policies,
+#                      data = analysis_data_with_hkt, family = "binomial")
+#   
+#   #store the coefficient for H_k(t)
+#   coef_hkt[grid_point] <- coef(treatment_initiation_model)["hkt"]
+#   coef_hkt_sum_policy[grid_point] <- coef(treatment_initiation_model)["sum_lag_policies:hkt"]
+#   
+#   #don't do 95% CI yet -- wait until we figure out how to get psi_1, psi_2
+#   # #conduct the Wald Test for the third coefficient, which is H_k(t) here since the first coefficient is the intercept
+#   # wald_test_results <- wald.test(vcov(treatment_initiation_model), coef(treatment_initiation_model), 3)
+#   # #we then store the p-value and store the psi values if the p-value > 0.05
+#   # pval <- wald_test_results$result$chi2["P"]
+#   # if(pval > 0.05){
+#   #   confidence_interval <- rbind(confidence_interval, psi_grid_params_two_param[grid_point,])
+#   # }
+# }
+
+##########################
+#stacked data
+#only need to run this once, so don't need to put it into the psi_1 computation function
+#first extract Y_{s,k} for the appropriate k = 40, ..., 2 for each t = 0, ..., k-1
+stacked_observed_Ysk <- compute_mimick_potential_outcome(dih_dataset, gamma_k_t = 1)
+
+#formula for the treatment initiation model
+tx_initiation_model_formula <- "dih_exposure~ 
+                       sum_lag_policies +  
+                       Time_Period_ID"
+
+#predict treatment initiation
+treatment_initiation_model_stacked <- glm(tx_initiation_model_formula,
+                                  data = stacked_observed_Ysk,
+                                  family = "binomial")
+stacked_observed_Ysk$prob_tx <- fitted(treatment_initiation_model_stacked)
+
+#filter to datapoints where k > t_s$* and where k <= t_s^*
+stacked_untreated_data <- stacked_observed_Ysk[stacked_observed_Ysk$treated_outcome_indicator == FALSE,]
+stacked_treated_data <- stacked_observed_Ysk[stacked_observed_Ysk$treated_outcome_indicator == TRUE,]
+
+psi_grid_params_psi_2 <- seq(-.02, .03, length.out = 500)
+psi_grid_params_psi_1 <- sapply(psi_grid_params_psi_2, function(psi_2){compute_psi_1(psi_2, 
+                                                                                             stacked_untreated_data, 
+                                                                                             stacked_treated_data)})
+
+
+################################
+#unstacked
+#pre_tx_data
+pre_tx_data <- dih_dataset %>%
+  filter(Intervention_Redefined < 1)
+
+#predict treatment initiation
+treatment_initiation_model_unstacked <- glm(tx_initiation_model_formula,
+                                  data = pre_tx_data,
+                                  family = "binomial")
+pre_tx_data$prob_tx <- fitted(treatment_initiation_model_unstacked)
+
+observed_Ysk_with_unstacked_estimated_prob_tx <- merge(stacked_observed_Ysk, pre_tx_data[,c("State", "Time_Period_ID", "prob_tx")],
+                                             by = c("State", "Time_Period_ID")) 
+
+#filter to datapoints where k > t_s$* and where k <= t_s^*
+unstacked_untreated_data <- observed_Ysk_with_unstacked_estimated_prob_tx[
+  observed_Ysk_with_unstacked_estimated_prob_tx$treated_outcome_indicator == FALSE,]
+unstacked_treated_data <- observed_Ysk_with_unstacked_estimated_prob_tx[
+  observed_Ysk_with_unstacked_estimated_prob_tx$treated_outcome_indicator == TRUE,]
+
+
+psi_grid_params_psi_2 <- seq(-.05, .05, length.out = 100)
+psi_grid_params_psi_1 <- sapply(psi_grid_params_psi_2, function(psi_2){compute_psi_1(psi_2, 
+                                                                                    unstacked_untreated_data, 
+                                                                                    unstacked_treated_data)})
+
+#################################
+
+#initialize the vector of coefficients for H(t) in treatment initiation model
+coef_hkt <- rep(NA, length(psi_grid_params_psi_2))
+coef_hkt_sum_policy <- rep(NA, length(psi_grid_params_psi_2))
+confidence_interval <- data.frame()
+
+
+for(grid_point in 1:length(psi_grid_params_psi_2)){
+  #statement to print the status of the for loop
+  if(grid_point%%10 == 0){print(grid_point)}
+  
+  #some psi_1 is NaN so we don't compute for those
+  if(!is.nan(psi_grid_params_psi_1)){
+    #compute H(t) given the dataset and gamma_k_t_when_treated
+    analysis_data_with_hkt <- compute_mimick_potential_outcome_two_parameter_model(dih_dataset, 
+                                                                                   psi_grid_params_psi_1[grid_point], 
+                                                                                   psi_grid_params_psi_2[grid_point])
+    
+    #fit model for treatment initiation
+    treatment_initiation_model <- glm(dih_exposure~ 
+                                        sum_lag_policies + 
+                                        hkt + 
+                                        Time_Period_ID + 
+                                        hkt*sum_lag_policies,
+                                      data = analysis_data_with_hkt, family = "binomial")
+    
+    #store the coefficient for H_k(t)
+    coef_hkt[grid_point] <- coef(treatment_initiation_model)["hkt"]
+    coef_hkt_sum_policy[grid_point] <- coef(treatment_initiation_model)["sum_lag_policies:hkt"]
+    
+    
+    #don't do 95% CI yet -- wait until we figure out how to get psi_1, psi_2
+    # #conduct the Wald Test for the third coefficient, which is H_k(t) here since the first coefficient is the intercept
+    wald_test_results <- wald.test(vcov(treatment_initiation_model), coef(treatment_initiation_model), Terms = c(3,5))
+    # #we then store the p-value and store the psi values if the p-value > 0.05
+    pval <- wald_test_results$result$chi2["P"]
+    if(pval > 0.05){
+      confidence_interval <- rbind(confidence_interval, c(psi_grid_params_psi_1[grid_point], 
+                                                          psi_grid_params_psi_2[grid_point]))
+    }
+  }
+}
+
+colnames(confidence_interval) <- c("psi_1", "psi_2")
+
+#stacked data
+#psi_1 = -0.078, 95% CI: (-0.759, 0.293)
+#psi_2 = 0.002, 95% CI:(-0.012, 0.027)
+
+# coef_hkt
+# coef_hkt_sum_policy
+```
+
+We check the intersection of $\psi_1$ and $\psi_2$ to see when the coefficients of `hkt` and `hkt:sum_lag_policies` are both 0. We create a grid of coefficient values where the rows indicate $\psi_1$ and the columns indicate $\psi_2$. The values indicate the coefficients of `hkt` and `hkt:sum_lag_policies`.
+```{r}
+psi_coef_data <- cbind(psi_grid_params_two_param, coef_hkt, coef_hkt_sum_policy)
+colnames(psi_coef_data) <- c("psi_1", "psi_2", "coef_hkt", "coef_hkt_sum_policy")
+# scatter3D(x = psi_coef_data$psi_1, y= psi_coef_data$psi_2, z = psi_coef_data$coef_hkt,  theta = 130, phi = 30,
+#           xlab = "psi 1", ylab = "psi 2", zlab = "Coef of H_k_t")
+# scatter3D(x = psi_coef_data$psi_1, y= psi_coef_data$psi_2, z = psi_coef_data$coef_hkt_sum_policy,  theta = 130, phi = 30,
+#           xlab = "psi 1", ylab = "psi 2", zlab = "Coef of H_k_t*sum_policy")
+
+#make a table where rows indicate psi_1 and columns indicate psi_2 and values are the coefficient values of H_{s,k}(t)
+coef_hkt_mat <- matrix(NA, nrow = length(unique(psi_grid_params_two_param$Var1)), ncol = length(unique(psi_grid_params_two_param$Var2)))
+rownames(coef_hkt_mat) <- unique(psi_grid_params_two_param$Var1)
+colnames(coef_hkt_mat) <- unique(psi_grid_params_two_param$Var2)
+
+#make a table where rows indicate psi_1 and columns indicate psi_2 and values are the coefficient values of H_{s,k}(t)*sum_policy
+coef_hkt_mat_sum_policy <- matrix(NA, nrow = length(unique(psi_grid_params_two_param$Var1)), 
+                                  ncol = length(unique(psi_grid_params_two_param$Var2)))
+rownames(coef_hkt_mat_sum_policy) <- unique(psi_grid_params_two_param$Var1)
+colnames(coef_hkt_mat_sum_policy) <- unique(psi_grid_params_two_param$Var2)
+
+for(grid_point in 1:nrow(psi_coef_data)){
+  coef_hkt_mat[as.character(psi_coef_data$psi_1[grid_point]), as.character(psi_coef_data$psi_2[grid_point])] <-
+    psi_coef_data$coef_hkt[grid_point]
+  coef_hkt_mat_sum_policy[as.character(psi_coef_data$psi_1[grid_point]), as.character(psi_coef_data$psi_2[grid_point])] <-
+    psi_coef_data$coef_hkt_sum_policy[grid_point]
+}
+coef_hkt_mat
+coef_hkt_mat_sum_policy
+
+```
+
+Looking at both tables, we see that the coefficients for both `hkt` and `hkt:sum_lag_policies` do not vary with $\psi_2$. We can also see this with the 3-D plot. When $\psi_1 \in (0,1)$, we see that coefficients for both `hkt` and `hkt:sum_lag_policies` are closer to 0. 
+
+# Old Code
+```{r, eval = FALSE}
+
+#the function to compute H(t) = H(t+1)/gamma_t, where gamma_t is given by parameters psi
+compute_h_k_t <- function(h_k_t_plus_1, gamma_k_t ){
+  h_k_t_plus_1/gamma_k_t
+}
+
+
+
+# # #the function to compute the mimicking potential outcomes (po)
+# # #here: df = input dataset, gamma_t is the vector of gammas = exp(psi*(a_t - a_{t-1}))
+# compute_mimick_po <- function(dataFrame, gamma_k_t){
+#   #new_df is the dataset we will return, with the new rows appended
+#   #we initialize it first as the input dataset df
+#   new_data_frame <- data.frame()
+# 
+#   #here, k is the time in which we observe the outcome and t is the time of the treatments
+#   #so we have k > t
+#   for(k in max(unique(dataFrame$Time_Period_ID)):2){
+#     #we first pull out the risk of OD at time k, so Y_k
+#     outcome_k <- dataFrame %>%
+#       arrange(State) %>%
+#       filter(Time_Period_ID == k) %>%
+#       dplyr::pull(prop_dead)
+# 
+#     #the first h(k+1) = Y(k+1)
+#     hkt_plus_1_helper <- outcome_k
+#     for(t in (k-1):1){
+#       #for each t< k, taking outcome Y_k, and we blip down at each t: H(t) = H(t + 1)/gamma_t
+#       hkt <- compute_h_k_t(hkt_plus_1_helper, gamma_k_t[dataFrame$Time_Period_ID == t])
+# 
+#       #creating the dataset for time t -- we first only take the rows for time t
+#       t_data_frame <- dataFrame %>%
+#         arrange(State) %>%
+#         filter(Time_Period_ID == t)
+#       #then for those rows, we add the computed H(t) as a column
+#       t_data_frame$hkt <- hkt
+# 
+#       #also compute k - t
+#       t_data_frame$len_tx <- k - t
+# 
+#       #we then append the rows to the new_df
+#       new_data_frame <- rbind(new_data_frame, t_data_frame)
+# 
+#       #store the H(t) to be used to compute H(t-1), so we store it as the next ht_plus_1
+#       hkt_plus_1_helper <- hkt
+#     }
+#   }
+#   new_data_frame
+# }
+
+compute_mimick_potential_outcome <- function(dataFrame, gamma_k_t){
+  #new_df is the dataset we will return, with the new rows appended
+  #we initialize it first as the input dataset df
+  new_data_frame <- data.frame()
+  
+  #here, k is the time in which we observe the outcome and t is the time of the treatments
+  #so we have k > t
+  for(k in max(unique(dataFrame$Time_Period_ID)):2){
+    #we first pull out the risk of OD at time k, so Y_k
+    outcome_k_data <- dataFrame %>%
+      arrange(State) %>%
+      filter(Time_Period_ID == k) %>%
+      dplyr::select(State, prop_dead)
+    
+    #compute H_k(t) given gamma_k_t:
+    #here, let t^* = treatment time 
+    #if t > t^*, then H_k(t) = Y_k since a_{t} - a_{t-1} = 0
+    #if t <= t^*, then H_k(t) = Y_k/gamma_k_t
+    outcome_k_data$hkt <- outcome_k_data$prop_dead/gamma_k_t
+    
+    # for(t in (k-1):1){
+    #   #creating the dataset for time t -- we first only take the rows for time t
+    #   t_data_frame <- dataFrame %>%
+    #     arrange(State) %>%
+    #     filter(Time_Period_ID == t) 
+    #   
+    #   #Compute H_k(t). Let t^* be the treatment time. 
+    #   #If t>t^*, then H_k(t) = Y_k. If t<= t^* then H_k(t) = Y_k/gamma_k_t
+    #   t_data_frame$hkt <- ifelse(t_data_frame$Time_Period_Start <= t_data_frame$Intervention_First_Date, outcome_k, outcome_k/gamma_k_t)
+    #   
+    #   #we then append the rows to the new_df
+    #   new_data_frame <- rbind(new_data_frame, t_data_frame)
+    # 
+    # }
+    
+    #filter the data for which A_{s,t} = 0 and the time interval that contains the treatment time since we only need these data 
+    #to predict treatment initiation for the model
+    #we also filter so that the t < k
+    untreated_and_first_tx_date_data <- dataFrame %>%
+      arrange(State, Time_Period_ID) %>%
+      filter(Time_Period_Start <= Intervention_First_Date,
+             Time_Period_ID < k)
+    
+    #merge the filtered dataset with the outcome_k_data which contains the computed H_k(t)
+    untreated_and_first_tx_date_data <- merge(untreated_and_first_tx_date_data, outcome_k_data[,c("State", "hkt")], by = "State")
+    
+    #compute k - t
+    untreated_and_first_tx_date_data$k_minus_t <- k - untreated_and_first_tx_date_data$Time_Period_ID
+    
+    #we then append the rows to the new_data_frame
+    new_data_frame <- rbind(new_data_frame, untreated_and_first_tx_date_data)
+  }
+  new_data_frame
+}
+
+```
+
+## $\gamma_t^k = exp(psi_1(a_t - a_{t-1}) + psi_2(a_t - a_{t-1})(k-t^*))$
+Here, we take into account of the period of time the outcome was observed, after treatment. The longer the treatment period, the larger the effect.
+$\gamma_t^k = exp(\psi_1(a_t - a_{t-1}) + \psi_2(a_t - a_{t-1})(k-t))$
+
+```{r, eval = FALSE}
+#multiple parameter gamma
+compute_mimick_po_w_gamma_function<- function(dataFrame, psi_grid_params, gamma_func){
+  #new_df is the dataset we will return, with the new rows appended
+  #we initialize it first as the input dataset dataFrame
+  new_data_frame <- data.frame()
+  
+  #here, k is the time in which we observe the outcome and t is the time of the treatments
+  #so we have k > t
+  for(k in max(unique(dataFrame$Time_Period_ID)):2){
+    #we first pull out the risk of OD at time k, so Y_k
+    outcome_k <- dataFrame %>%
+      arrange(State) %>%
+      filter(Time_Period_ID == k) %>%
+      dplyr::pull(prop_dead)
+    
+    #store h(k+1) = Y(k+1)
+    hkt_plus_1 <- outcome_k
+    for(t in (k-1):1){
+      #compute gamma_t using function
+      gamma_k_t <- gamma_func(dataFrame, k, t, psi_grid_params)
+      
+      #for each t< k, taking outcome Y_k, and we blip down at each t: H(t) = H(t + 1)/gamma_t
+      hkt <- compute_h_k_t(hkt_plus_1, gamma_k_t)
+      
+      #creating the dataset for time t -- we first only take the rows for time t
+      t_data_frame  <- dataFrame %>%
+        arrange(State) %>%
+        filter(Time_Period_ID == t) 
+      #then for those rows, we add the computed H(t) as a column
+      t_data_frame$hkt <- hkt
+      
+      #also compute k - t
+      t_data_frame$len_tx <- k - t
+      
+      #we then append the rows to the new_df
+      new_df <- rbind(new_data_frame, t_data_frame )
+      
+      #store the H(t) to be used to compute H(t-1)
+      hkt_plus_1 <- hkt
+    }
+  }
+  new_data_frame 
+}
+```
+
+```{r, eval = FALSE}
+#checked -5 to 5, coefficients became larger as grid went up, so try more negative
+#checked -6 to -5
+#checked -10 to -6
+#checked -13 to -10
+#checked -15 to -13
+#create a vector of 100 psi
+# psi_grid_params <- seq(-0.1012847, -0.1012846, length.out = 100)
+psi_grid_params_two_param <- expand.grid(seq(-5, 5, length.out = 20), seq(-0.263, 0.263, by = 0.01))
+
+#gamma function to compute the two parameter model
+gamma_two_param <- function(df, k, t, psi_grid_params){
+  #extract the treatment allocation
+  df_subset_t <- df %>%
+    arrange(State, Time_Period_ID) %>%
+    filter(Time_Period_ID == t) %>%
+    pull(Intervention_Redefined)
+  
+  if(t > 1){
+    df_subset_t_minus_1 <- df %>%
+      arrange(State, Time_Period_ID) %>%
+      filter(Time_Period_ID == t-1) %>%
+      pull(Intervention_Redefined)
+  }else{
+    df_subset <- df %>%
+    arrange(State, Time_Period_ID) %>%
+    filter(Time_Period_ID == t)
+    
+    df_subset_t_minus_1 <- rep(0, length(df_subset_t))
+    df_subset_t_minus_1[df_subset$State == "Ohio"] <- df_subset$Intervention_Redefined[df_subset$State == "Ohio" &
+                                                                                         df_subset$Time_Period_ID == t]
+    df_subset_t_minus_1[df_subset$State == "Georgia"] <- df_subset$Intervention_Redefined[df_subset$State == "Georgia" &
+                                                                                         df_subset$Time_Period_ID == t]
+  }
+
+  
+  exp(unlist(psi_grid_params[1])*(df_subset_t - df_subset_t_minus_1) + 
+        unlist(psi_grid_params[2])*(df_subset_t - df_subset_t_minus_1)*(k-t))
+}
+
+
+
+#initialize the vector of coefficients for H(t) in treatment initiation model
+coef_ht_1 <- coef_ht_2 <- rep(NA, nrow(psi_grid_params_two_param))
+for(grid_point in 1:nrow(psi_grid_params_two_param)){
+  #statement to print the status of the for loop
+  if(grid_point%%10 == 0){print(grid_point)}
+  
+  #compute H(t) given the dataset and gamma_t
+  data_w_ht <- compute_mimick_po_w_gamma_function(dih_dataset, psi_grid_params_two_param[grid_point,], gamma_two_param)
+ 
+  #filter the dataset to only time periods when treatment hasn't occurred yet and the first time point in which treatment occurred
+  analysis_data_with_hkt <- data_w_ht %>%
+    filter(Time_Period_Start <= floor_date(Intervention_First_Date, "6 months"))
+  
+  #fit model for treatment initiation
+  treatment_initiation_model <- glm(Intervention_Redefined~ 
+                       sum_lag_policies + 
+                       ht + 
+                       Time_Period_ID + 
+                       ht*sum_lag_policies,
+                     data = analysis_data_with_hkt, family = "binomial")
+  
+  #store the coefficient for
+  coef_ht_1[grid_point] <- coef(treatment_initiation_model)["ht"]
+  coef_ht_2[grid_point] <- coef(treatment_initiation_model)["sum_lag_policies:ht"]
+  
+  
+}
+
+coef_ht_1
+coef_ht_2
+psi_grid_params_two_param[200:201,]
+
+
+```
+
+
+

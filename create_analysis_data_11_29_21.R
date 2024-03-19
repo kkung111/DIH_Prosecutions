@@ -517,6 +517,8 @@ medicaid_start_dates_data$expansion_date[medicaid_start_dates_data$State == "Min
 medicaid_start_dates_data$expansion_date[medicaid_start_dates_data$State == "New Jersey"]<-as.Date("4-14-2011", "%m-%d-%Y")
 medicaid_start_dates_data$expansion_date[medicaid_start_dates_data$State == "Washington"]<-as.Date("1-3-2011", "%m-%d-%Y")
 
+#note that the OD data is only until 2019, but there are several states with intervention date after 2019: Missouri, Oklahoma, Nebraska, Idaho, Utah
+
 #store the vector of start dates for medicaid expansion
 medicaid_start_dates<-as.Date(medicaid_start_dates_data$expansion_date[medicaid_start_dates_data$State != "District of Columbia"])
 names(medicaid_start_dates)<-state.name
